@@ -47,10 +47,10 @@ class RegistryContextBoundaryTests(unittest.TestCase):
             requests_started.wait(timeout=2)
             if name == "b":
                 raise roadmap.RegistryInfrastructureError("incomplete registry")
-            return {"name": name}
+            return {"name": name}, True
 
         deps = [("a", "runtime", "^1.0.0"), ("b", "runtime", "^1.0.0")]
-        with patch.object(roadmap.LiveDataClient, "fetch_npm_metadata", fetch):
+        with patch.object(roadmap.LiveDataClient, "_fetch_npm_metadata_result", fetch):
             failures = roadmap._prefetch_draft_registry_window(client, deps)
         self.assertCountEqual(seen, ["a", "b"])
         self.assertEqual(client.npm_cache, {"a": {"name": "a"}})
@@ -60,7 +60,7 @@ class RegistryContextBoundaryTests(unittest.TestCase):
         client = roadmap.LiveDataClient("https://fixture.invalid/npm", timeout=2, batch_size=10, sleep_sec=0)
         client.set_deadline(roadmap.DeadlineClock(0))
         client.npm_cache["previous"] = {"name": "previous"}
-        with patch.object(roadmap.LiveDataClient, "fetch_npm_metadata") as fetch:
+        with patch.object(roadmap.LiveDataClient, "_fetch_npm_metadata_result") as fetch:
             with self.assertRaises(roadmap.DraftBudgetExceeded):
                 roadmap._prefetch_draft_registry_window(
                     client, [("a", "runtime", "^1.0.0"), ("b", "runtime", "^1.0.0")],
