@@ -93,6 +93,26 @@ def _equivalent_relocations(before, after, before_edges, after_edges):
     return moves
 
 
+def _displaced_held_slots(before, after, held_pairs, replaced_slots):
+    """Identify a unique held copy displaced by an explicitly selected version."""
+    candidates = {(old, new) for old, new in held_pairs
+                  if old in replaced_slots and new not in before and before[old] == after[new]}
+    if not candidates:
+        return {}
+    counts = []
+    for graph in (before, after):
+        identities = defaultdict(int)
+        for path, entry in graph.items():
+            identity = _relocation_identity(path, entry)
+            if identity is not None:
+                identities[identity] += 1
+        counts.append(identities)
+    return {new: old for old, new in sorted(candidates)
+            if (identity := _relocation_identity(old, before[old])) is not None
+            and _relocation_identity(new, after[new]) == identity
+            and all(index[identity] == 1 for index in counts)}
+
+
 def _check_held_graph(before, after, before_edges, after_edges, owners, authorized, moves):
     """Preserve the closure of every declaration outside the authorized delta."""
     new_path = {old: new for new, old in moves.items()}
@@ -168,6 +188,8 @@ def check_workspace_lock_delta(
     if reauthored is not None:
         seeds.add(reauthored)
     impacted = set()
+    held_pairs = set()
+    replaced_slots = set()
     for declaration in sorted(assignment):
         left, right = (_instance(graph, declaration) for graph in (before, after))
         if left is None or right is None:
@@ -175,6 +197,10 @@ def check_workspace_lock_delta(
         if declaration not in changed and _artifact(before[left[0]]) != _artifact(after[right[0]]):
             return {"status": "RESOLUTION_FAILED", "code": "HELD_LOCK_ARTIFACT_CHANGED",
                     "declaration": list(declaration)}
+        if declaration not in changed:
+            held_pairs.add((left[0], right[0]))
+        elif left[0] == right[0] and _artifact(before[left[0]]) != _artifact(after[right[0]]):
+            replaced_slots.add(left[0])
         if declaration in seeds:
             impacted.update((left[0], right[0]))
 
@@ -182,7 +208,8 @@ def check_workspace_lock_delta(
     before_edges = {path: _edges(before, path) for path in before}
     after_edges = {path: _edges(after, path) for path in after}
     moves = _equivalent_relocations(before, after, before_edges, after_edges)
-    relocated = moves.keys() | set(moves.values())
+    displaced = _displaced_held_slots(before, after, held_pairs, replaced_slots)
+    relocated = moves.keys() | set(moves.values()) | displaced.keys()
     delta = {path for path in nodes - owners if before.get(path) != after.get(path)}
     for path in sorted(delta):
         if before.get(path, {}).get("link") or after.get(path, {}).get("link"):
@@ -210,7 +237,7 @@ def check_workspace_lock_delta(
         return {"status": "RESOLUTION_FAILED", "code": "LOCK_UNRELATED_NODE_DELTA",
                 "path": outside[0], "unrelatedCount": len(outside)}
 
-    held_failure = _check_held_graph(before, after, before_edges, after_edges, owners, seeds, moves)
+    held_failure = _check_held_graph(before, after, before_edges, after_edges, owners, seeds, moves | displaced)
     if held_failure is not None:
         return held_failure
 

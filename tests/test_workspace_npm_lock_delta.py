@@ -75,6 +75,24 @@ class WorkspaceLockDeltaTests(unittest.TestCase):
         self.before["packages"][new_path] = deepcopy(self.before["packages"][old_path])
         self.assertEqual(self.check()["code"], "LOCK_UNRELATED_NODE_DELTA")
 
+    def test_held_copy_can_move_when_selected_version_reuses_its_old_slot(self):
+        old_path = "node_modules/target"
+        new_path = "app/node_modules/target"
+        for lock in (self.before, self.after):
+            lock["packages"]["app"]["dependencies"]["target"] = "1.0.0"
+        self.assignment[("app", "dependencies", "target")] = "1.0.0"
+        original = self.before["packages"][old_path]
+        original.update(resolved="https://registry.npmjs.org/target/-/target-1.0.0.tgz",
+                        integrity="sha512-original")
+        original.pop("dependencies")
+        self.after["packages"][new_path] = deepcopy(original)
+        self.assertEqual(self.check()["status"], "RESOLUTION_PASSED")
+
+        for lock in (self.before, self.after):
+            lock["packages"]["ui"] = {"peerDependencies": {"target": "^1 || ^2"}}
+        self.assertEqual(self.check()["code"], "HELD_LOCK_PROVIDER_CHANGED")
+        self.assertEqual(self.check()["path"], "ui")
+
     def test_workspace_link_and_unapproved_manifest_edit_are_rejected(self):
         self.after["packages"]["node_modules/app"]["resolved"] = "unrelated"
         self.assertEqual(self.check()["code"], "LOCK_WORKSPACE_LINK_CHANGED")
