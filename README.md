@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/deploom-core-mark.png" width="112" alt="Deploom Core logo" />
+<img src="assets/social-preview.png" width="768" alt="Deploom Core banner" />
 
 # Deploom Core
 
