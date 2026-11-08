@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+<title id="title">Deploom CORE mark</title><desc id="desc">Deploom family mark with stable Core kernel</desc>
+<defs>
+<radialGradient id="bg" cx="36%" cy="23%" r="85%"><stop stop-color="#1C2348"/><stop offset=".52" stop-color="#11182E"/><stop offset="1" stop-color="#0A1020"/></radialGradient>
+<linearGradient id="outer" x1=".1" y1="0" x2=".9" y2="1"><stop stop-color="#B396FF"/><stop offset=".4" stop-color="#6D83FE"/><stop offset=".72" stop-color="#36C0F1"/><stop offset="1" stop-color="#53EACC"/></linearGradient>
+<linearGradient id="accent" x1="0" y1="1" x2="1" y2="0"><stop stop-color="#A390FF"/><stop offset=".5" stop-color="#31BDFA"/><stop offset="1" stop-color="#60EDC5"/></linearGradient>
+</defs>
+<circle cx="256" cy="256" r="246" fill="url(#bg)"/><circle cx="256" cy="256" r="243" fill="none" stroke="#8C95F8" stroke-opacity=".13" stroke-width="2"/>
+<path d="M155 133 V379 H226 C321 379 375 329 375 256 C375 183 321 133 226 133 H155" fill="none" stroke="url(#outer)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+
+<circle cx="265" cy="253" r="72" fill="none" stroke="#427CF3" stroke-width="11" stroke-opacity=".25"/>
+<circle cx="265" cy="253" r="44" fill="none" stroke="#43C8EE" stroke-width="12" stroke-opacity=".87"/>
+<circle cx="265" cy="253" r="18" fill="#6CF3D1"/>
+<path d="M266 198 V209 M266 297 V308 M209 253 H220 M310 253 H321" fill="none" stroke="#BCACFF" stroke-width="8" stroke-linecap="round"/>
+
+</svg>

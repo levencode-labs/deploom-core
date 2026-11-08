@@ -1,27 +1,16 @@
-# Using DepLoom Core in MCP
+# Deploom Core ↔ Deploom MCP integration
 
-1. Verify the new Core release revision and its headless CI.
-2. Point `DepLoom/mcp`'s `.gitmodules` at
-   `https://github.com/DepLoom/core.git` and update the
-   `upstream/deploom` gitlink to the exact committed Core revision.
-3. Recompute the 133-file Core SHA-256 inventory in
-   `DepLoom/mcp/release-manifest.json`; preserve schema and Skill hashes.
-   The updated Core `peer_solver_transition.py` and
-   `draft_input_identity.py` differ from the previous pin.
-4. Run MCP's contract/target-assessment tests, stdio smoke, full CI matrix,
-   sdist → wheel and installed-wheel smoke outside checkout.
-5. Run a small **planning-only** fixture through MCP with
-   `policies: {"sample-router": "required"}`; verify it returns an
-   applicable Draft or an authentic blocker, never a false
-   `INVALID_CURRENT_ENDPOINT`.
-6. Freeze Core/MCP revisions, no-Skill setup and fixture evidence before
-   comparing agent + MCP against a bare agent.
+[Core](https://github.com/levencode-labs/deploom-core) is developed in its own repository. [MCP](https://github.com/levencode-labs/deploom-mcp) pins an exact Core revision at `upstream/deploom` and packages the verified inventory into the published wheel.
 
-**Repository visibility:** If MCP is public and Core stays private,
-`actions/checkout` in MCP cannot fetch the private submodule with its
-ordinary repository-scoped `GITHUB_TOKEN`. Either make Core public or
-configure a dedicated least-privileged read-only credential for this cross-repo
-checkout, in compliance with the organization's security policy. Do not
-publish a private Core's source through a public wheel by accident.
+## Updating the pinned Core (maintainers)
 
-This repo contains no Desktop release workflow or automatic migration runner.
+1. Make and verify the Core change in **deploom-core**. Record the exact commit SHA and its own CI/evidence.
+2. Review the MCP `.gitmodules` origin and `upstream/deploom` gitlink. The new canonical repository URL is `https://github.com/levencode-labs/deploom-core.git`. A submodule URL rewrite is a **separate engineering change**, not part of cosmetic documentation updates.
+3. Update to the approved Core commit only; do not edit Core files inside the MCP submodule.
+4. Regenerate the exact content inventory and other derived integrity records using MCP's documented release scripts. Preserve schema and canonical Skill integrity requirements.
+5. Run the MCP source tests, stdio protocol smoke, installed-wheel checks, and required Windows/Linux gates at the pinned revision.
+6. Keep runtime and migration acceptance separate from a successful build or planner result. A Draft is not an installed migration.
+
+Do not simply replace hashes in `release-manifest.json`: the manifest must be regenerated from the staged gitlink and real contents. When Core is private, repository-scoped CI credentials may not be able to fetch it; confirm cross-repository checkout access without exposing private source through the wheel.
+
+[Full release procedure](https://github.com/levencode-labs/deploom-mcp/blob/main/docs/RELEASING.md) · [Execution boundary](https://github.com/levencode-labs/deploom-mcp/blob/main/docs/GOAL_EXECUTION_SUPPORT.md)

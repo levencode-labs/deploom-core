@@ -1,84 +1,73 @@
-# DepLoom Core
+<div align="center">
 
-Release maintainers: see the [component release instructions](docs/RELEASING.md).
+<img src="assets/deploom-core-mark.png" width="112" alt="Deploom Core logo" />
 
-**Headless, evidence-aware dependency upgrade planning for JavaScript projects.**
+# Deploom Core
 
-DepLoom Core proposes bounded dependency-version assignments, evaluates npm peer
-constraints through a Z3-backed solver, and preserves reasons, policy state and
-missing evidence. The result is a **Draft plan** — not an installed, verified
-migration.
+**Dependency planning with explicit constraints and evidence.**
 
-Core is designed to be used without the former Electron/Desktop application.
-[DepLoom MCP](https://github.com/DepLoom/mcp) exposes the planner to coding
-agents and transforms its results into a compact, structured Upgrade Blueprint.
+[Levencode Labs](https://github.com/levencode-labs) · [Deploom MCP](https://github.com/levencode-labs/deploom-mcp) · [Releases](https://github.com/levencode-labs/deploom-core/releases)
 
-## What Core provides
+</div>
 
-- Dependency-version candidates within explicitly approved major lines and
-  user-selected mutable scope.
-- Distinct objectives for minimum changes needed to meet health policy versus
-  newer compatible candidates in approved version lines.
-- Explicit `pinned` / `advisory` target authority and explanations of known
-  peer conflicts, blockers, deferred work and unknown security evidence.
-- Source/workspace input coverage and semantic input fingerprints to help
-  identify stale plans.
-- A deterministic static solver under fixed inputs — **not** a claim that
-  agent edits, npm resolution, registry state or runtime behavior are deterministic.
+Deploom Core is a headless Python engine for planning dependency upgrades in JavaScript/TypeScript projects. It models candidate versions and compatibility requirements, records which declarations the user has authorized to change, and reports what is known, blocked, or still unverified.
 
-A Draft remains `PLANNING_ONLY`, `NOT_VERIFIED`. Project checks, npm install,
-installed-tree audit and runtime acceptance remain separate responsibilities.
-The current planner covers selected manifests; it does **not** solve an entire
-multi-workspace graph jointly.
+**Core creates plans. It does not automatically prove that an npm installation, an application's tests, or runtime behavior will succeed.**
+
+## What it does
+
+- Proposes version candidates within selected scope and approved version lines.
+- Uses a Z3-backed model for declared compatibility/peer constraints and finite joint choices where supported.
+- Distinguishes minimum changes needed for a health objective from newer choices within approved lines.
+- Preserves `pinned` versus `advisory` target authority, unchanged declarations, blockers, deferred work, and missing evidence.
+- Tracks source/workspace coverage and input identities so stale or partial plans remain visible.
+- Supports constrained npm workspace scenarios, but does **not** claim arbitrary monorepo, lockfile, or runtime correctness from a static assignment.
+
+A Draft proposal is **`PLANNING_ONLY` / `NOT_VERIFIED`**. An accepted lockfile, a clean install, effective dependency providers, project checks, and runtime acceptance are separate results.
+
+## Where it fits
+
+```text
+Developer / coding agent
+        │
+        ▼
+  Deploom MCP
+        │  structured request / Blueprint
+        ▼
+  Deploom Core
+        │  versions, constraints, evidence
+        ▼
+  Proposed plan  →  independent npm + project verification
+```
+
+[Deploom MCP](https://github.com/levencode-labs/deploom-mcp) is the user-facing agent integration and includes a pinned copy of Core in its published wheel. You do not need to install Core separately to run that wheel.
 
 ## Local development
 
-Python **3.12 or 3.13** is supported for this package.
+Supported Core Python range: **3.12–3.13** (`>=3.12,<3.14`). From a clean checkout:
 
 ```sh
 python -m venv .venv
 python -m pip install -e .
 python dependency_live_roadmap_generator.py --help
-python -m unittest discover -s tests -p "test_required_planner.py" -v
+python -m unittest discover -s tests -p 'test_required_planner.py' -v
 ```
 
-The independent [lightweight CI](.github/workflows/ci.yml) runs a curated,
-headless planner regression suite on Linux and Windows. See the
-[testing boundary](docs/TESTING.md) for coverage and exclusions.
-It does not run Electron, Desktop, npm migration benchmarks or the historical
-monorepo test suite.
+Use the interpreter from your virtual environment if `python` resolves elsewhere. The [CI workflow](.github/workflows/ci.yml) and [testing notes](docs/TESTING.md) describe which tests are covered; a green lightweight suite is not a full migration acceptance.
 
-## Architecture and scope
+## Documentation
 
-This extraction keeps the explicit headless runtime inventory
-previously bundled in MCP, with stable module names for compatibility.
-It is an operational split and a focused test split, **not yet a minimal
-import-closure refactor**. Further shrinking should follow measured import
-dependencies and regression coverage, rather than deleting modules by name.
+- [MCP integration and pinned Core](docs/INTEGRATION.md)
+- [Testing boundary](docs/TESTING.md)
+- [Release process](docs/RELEASING.md)
+- [Architecture/extraction background](docs/EXTRACTION_STATUS.md)
+- [Historical experiments and limitations](docs/AB_NO_SKILL_PROTOCOL.md)
 
-The required-update transition regression is fixed here: `required` applies
-to the **final** solver assignment, not the original state before upgrading;
-genuine peer constraints still constrain transition cohorts.
-
-- [Core 0.1.1 changes and boundaries](docs/RELEASE_0_1_1.md)
-- [Decision contract](docs/DRAFT_DECISION_CONTRACT.md)
-- [Extraction status](docs/EXTRACTION_STATUS.md)
-- [MCP integration instructions](docs/INTEGRATION.md)
-- [No-Skill agent A/B protocol](docs/AB_NO_SKILL_PROTOCOL.md)
-
-## Repository map
+## Repository family
 
 | Repository | Purpose |
-| --- | --- |
-| **[DepLoom/core](https://github.com/DepLoom/core)** | Headless dependency decision engine |
-| **[DepLoom/mcp](https://github.com/DepLoom/mcp)** | MCP adapter, Blueprint projection and optional Skill |
-| [AlexanderLevenskikh/deploom](https://github.com/AlexanderLevenskikh/deploom) | Historical Desktop/monorepo implementation |
+| :-- | :-- |
+| **[deploom-core](https://github.com/levencode-labs/deploom-core)** | Core decision and planning engine |
+| **[deploom-mcp](https://github.com/levencode-labs/deploom-mcp)** | MCP tools, Blueprint adapter, agent Skill, and authorized evidence workflows |
 
-## Evidence and limitations
-
-Early diagnostic comparisons found no functional advantage from the full Skill
-on one small React Router migration pair. Those studies do not establish
-whether the solver-backed Blueprint helps agents make better upgrade decisions
-on complex dependency graphs. The next experiment isolates **agent + MCP
-(without Skill)** against a bare agent with matching tasks and quality gates.
-See the protocol above; no speedup is claimed.
+**Release status:** the most recently verified public Core release when this README was prepared (2026-11-08) was [`v0.1.7`](https://github.com/levencode-labs/deploom-core/releases/tag/v0.1.7). For newer releases use the [Releases page](https://github.com/levencode-labs/deploom-core/releases/latest). Do not equate published binaries with acceptance on your own project.
