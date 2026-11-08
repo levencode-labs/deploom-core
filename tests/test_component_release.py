@@ -21,7 +21,7 @@ class ReleaseStateTests(unittest.TestCase):
         self.call('init','-b','main');self.call('config','user.name','Release Fixture');self.call('config','user.email','fixture@example.invalid');self.call('config','commit.gpgSign','false');self.call('config','tag.gpgSign','false');self.call('config','core.autocrlf','false')
         self.original=b'[project]\r\nname = "deploom-core"\r\nversion = "0.1.1"\r\ndescription = "preserve"\r\n'
         (self.root/'pyproject.toml').write_bytes(self.original);(self.root/'.gitignore').write_text('.component-release/\n__pycache__/\n');(self.root/'README.md').write_text('public overview\n');self.call('add','.');self.call('commit','-m','source')
-        self.base=self.call('rev-parse','HEAD');self.call('update-ref','refs/remotes/origin/main',self.base);self.call('remote','add','origin','git@github.com:DepLoom/core.git')
+        self.base=self.call('rev-parse','HEAD');self.call('update-ref','refs/remotes/origin/main',self.base);self.call('remote','add','origin','git@github.com:levencode-labs/deploom-core.git')
     def call(self,*args):
         r=subprocess.run(['git','-C',str(self.root),*args],capture_output=True,text=True,timeout=15)
         if r.returncode:raise RuntimeError('fixture Git failed: '+str(args))
@@ -58,7 +58,7 @@ class ReleaseStateTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError,'REQUIRES_MAIN'):release.prepare(self.root)
         self.call('switch','main');self.call('remote','set-url','origin','git@github.com:example/other.git')
         with self.assertRaisesRegex(release.ReleaseError,'SSH_ORIGIN'):release.prepare(self.root)
-        self.call('remote','set-url','origin','git@github.com:DepLoom/core.git');(self.root/'README.md').write_text('new source');self.call('add','README.md');self.call('commit','-m','unmerged source')
+        self.call('remote','set-url','origin','git@github.com:levencode-labs/deploom-core.git');(self.root/'README.md').write_text('new source');self.call('add','README.md');self.call('commit','-m','unmerged source')
         with self.assertRaisesRegex(release.ReleaseError,'NOT_SYNCED'):release.prepare(self.root)
         self.assertEqual((self.root/'pyproject.toml').read_bytes(),self.original)
     def test_atomic_push_and_retry_never_bump_or_force_existing_tag(self):
@@ -100,10 +100,10 @@ class ReleaseStateTests(unittest.TestCase):
 
 class ExactWorkflowIdentityTests(unittest.TestCase):
     def test_definition_on_moving_main_cannot_release_another_tag_commit(self):
-        with patch.object(ci,'package',return_value=('deploom-core','0.1.2')),patch.object(ci,'git',return_value='a'*40),patch.dict(os.environ,{'GITHUB_REPOSITORY':'DepLoom/core','GITHUB_SHA':'b'*40}):
+        with patch.object(ci,'package',return_value=('deploom-core','0.1.2')),patch.object(ci,'git',return_value='a'*40),patch.dict(os.environ,{'GITHUB_REPOSITORY':'levencode-labs/deploom-core','GITHUB_SHA':'b'*40}):
             with self.assertRaisesRegex(release.ReleaseError,'DEFINITION_NOT_FROM_TAG'):ci.identity('v0.1.2')
     def test_publisher_refuses_missing_qualified_bundle_before_any_api(self):
-        value={'repository':'DepLoom/core','package':'deploom-core','version':'0.1.2','tag':'v0.1.2','commit':'a'*40,'tagObject':'c'*40}
+        value={'repository':'levencode-labs/deploom-core','package':'deploom-core','version':'0.1.2','tag':'v0.1.2','commit':'a'*40,'tagObject':'c'*40}
         with patch.object(ci,'identity',return_value=value),patch.object(ci,'api') as api,patch.dict(os.environ,{'EXPECTED_MANIFEST_SHA256':'','RELEASE_ARTIFACT_ID':'','RELEASE_ARTIFACT_DIGEST':''}):
             with self.assertRaisesRegex(release.ReleaseError,'BUNDLE_IDENTITY_MISSING'):ci.publish('v0.1.2',ROOT)
         api.assert_not_called()
@@ -112,14 +112,14 @@ class DraftReleaseLookupTests(unittest.TestCase):
     def test_existing_draft_is_found_without_tag_endpoint(self):
         draft={'id':432459869,'tag_name':'v0.1.2','draft':True,'assets':[]}
         with patch.object(ci,'api',return_value=[draft]) as request:
-            self.assertEqual(ci.find_release('DepLoom/core','v0.1.2'),draft)
-        request.assert_called_once_with('repos/DepLoom/core/releases?per_page=100&page=1')
+            self.assertEqual(ci.find_release('levencode-labs/deploom-core','v0.1.2'),draft)
+        request.assert_called_once_with('repos/levencode-labs/deploom-core/releases?per_page=100&page=1')
     def test_pagination_absence_duplicate_and_api_failure_fail_closed(self):
         first=[{'tag_name':'other'}]*100;draft={'id':1,'tag_name':'v0.1.2','draft':True}
-        with patch.object(ci,'api',side_effect=[first,[draft]]):self.assertEqual(ci.find_release('DepLoom/core','v0.1.2'),draft)
-        with patch.object(ci,'api',return_value=[]):self.assertIsNone(ci.find_release('DepLoom/core','v0.1.2'))
-        with patch.object(ci,'api',return_value=[draft,draft]),self.assertRaisesRegex(release.ReleaseError,'DUPLICATE'):ci.find_release('DepLoom/core','v0.1.2')
-        with patch.object(ci,'api',side_effect=release.ReleaseError('denied')),self.assertRaisesRegex(release.ReleaseError,'denied'):ci.find_release('DepLoom/core','v0.1.2')
+        with patch.object(ci,'api',side_effect=[first,[draft]]):self.assertEqual(ci.find_release('levencode-labs/deploom-core','v0.1.2'),draft)
+        with patch.object(ci,'api',return_value=[]):self.assertIsNone(ci.find_release('levencode-labs/deploom-core','v0.1.2'))
+        with patch.object(ci,'api',return_value=[draft,draft]),self.assertRaisesRegex(release.ReleaseError,'DUPLICATE'):ci.find_release('levencode-labs/deploom-core','v0.1.2')
+        with patch.object(ci,'api',side_effect=release.ReleaseError('denied')),self.assertRaisesRegex(release.ReleaseError,'denied'):ci.find_release('levencode-labs/deploom-core','v0.1.2')
 
 class ImmutableAssetTests(unittest.TestCase):
     def test_missing_assets_can_resume_but_different_or_unknown_assets_cannot(self):
@@ -130,7 +130,7 @@ class ImmutableAssetTests(unittest.TestCase):
             with self.subTest(rows=rows),self.assertRaises(release.ReleaseError):ci.reconcile_assets(rows,expected)
     def test_source_identity_and_checksum_tamper_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
-            folder=Path(raw);value={'repository':'DepLoom/core','package':'deploom-core','version':'0.1.2','tag':'v0.1.2','commit':'a'*40,'tagObject':'c'*40}
+            folder=Path(raw);value={'repository':'levencode-labs/deploom-core','package':'deploom-core','version':'0.1.2','tag':'v0.1.2','commit':'a'*40,'tagObject':'c'*40}
             for name in ['deploom_core-0.1.2-py3-none-any.whl','deploom_core-0.1.2.tar.gz']:(folder/name).write_bytes(b'fixture bytes, not a built distribution')
             (folder/'RELEASE-EVIDENCE.json').write_text(json.dumps(value))
             (folder/'SHA256SUMS.txt').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in sorted(folder.iterdir())))
@@ -152,8 +152,8 @@ class McpVersionSynchronizationTests(unittest.TestCase):
             subprocess.run(['git','-C',str(core),*args],check=True,capture_output=True,timeout=15)
         (core/'VERSION').write_text('engine-fixture');(core/'fixture.py').write_text('VALUE=1\n')
         subprocess.run(['git','-C',str(core),'add','.'],check=True,capture_output=True,timeout=15);subprocess.run(['git','-C',str(core),'commit','-m','fixture core'],check=True,capture_output=True,timeout=15)
-        (root/'.gitmodules').write_text('[submodule "upstream/deploom"]\n path = upstream/deploom\n url = git@github.com:DepLoom/core.git\n')
-        f.call('add','.');f.call('remote','set-url','origin','git@github.com:DepLoom/mcp.git')
+        (root/'.gitmodules').write_text('[submodule "upstream/deploom"]\n path = upstream/deploom\n url = git@github.com:levencode-labs/deploom-core.git\n')
+        f.call('add','.');f.call('remote','set-url','origin','git@github.com:levencode-labs/deploom-mcp.git')
         subprocess.run([sys.executable,'-B','scripts/update_release_manifest.py'],cwd=root,check=True,capture_output=True,timeout=30)
         f.call('add','.');f.call('commit','-m','MCP fixture');f.call('update-ref','refs/remotes/origin/main',f.call('rev-parse','HEAD'))
         pin=json.loads((root/'release-manifest.json').read_bytes())['core']['revision']
