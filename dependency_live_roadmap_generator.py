@@ -3013,6 +3013,10 @@ class LiveDataClient:
         return value
 
     def fetch_npm_metadata(self, pkg: str):
+        return self._fetch_npm_metadata_result(pkg)[0]
+
+    def _fetch_npm_metadata_result(self, pkg: str):
+        """Return the packument and whether it is reusable by an independent client."""
         from planning_cache import planning_lease
         context, durable = request_context(self.session, self.registry, self.metadata_cache_tool_version)
         if not durable or self.metadata_cache_dir is None or self.metadata_cache_ttl <= 0:
@@ -3024,26 +3028,30 @@ class LiveDataClient:
         def fetch():
             with planning_lease(["packument", str(self.metadata_cache_dir.resolve()), self.registry, context, pkg],
                                 check=check, timeout=self.timeout):
-                data = self._fetch_npm_metadata_live(pkg)
-                return data, 1, "" if isinstance(data, dict) else "unavailable", "registry-http"
+                data, reusable = self._fetch_npm_metadata_live(pkg)
+                reason = "stateful" if not reusable else "" if isinstance(data, dict) else "unavailable"
+                return data, 1, reason, "registry-http"
         if context != self._metadata_request_context:
             self.npm_cache.clear()
             self._metadata_request_context = context
         if pkg in self.npm_cache:
             if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
-                return self.npm_cache[pkg]
+                return self.npm_cache[pkg], True
             self.npm_cache.pop(pkg, None)
-        data, executed, *_ = cached_query(["public-packument-v1", self.registry, context, pkg], fetch,
-                                         ttl=self.metadata_cache_ttl, check=check)
+        data, executed, reason, _ = cached_query(["public-packument-v3", self.registry, context, pkg], fetch,
+                                                ttl=self.metadata_cache_ttl, check=check)
+        reusable = reason != "stateful"
         if data is None:  # legitimate registry HTTP 404 package absence
-            self.npm_cache[pkg] = None
-            return None
+            if reusable:
+                self.npm_cache[pkg] = None
+            return None, reusable
         if not valid_registry_packument_shape(data):
             raise RegistryInfrastructureError("REGISTRY_METADATA_INVALID_SHAPE: cached metadata lacks valid versions/dist")
         if not executed and isinstance(data, dict):
             self._metadata_cache_disk_hits += 1
-        self.npm_cache[pkg] = data
-        return data
+        if reusable:
+            self.npm_cache[pkg] = data
+        return data, reusable
 
     def _fetch_npm_metadata_live(self, pkg: str):
         context, durable = request_context(self.session, self.registry, self.metadata_cache_tool_version)
@@ -3052,7 +3060,7 @@ class LiveDataClient:
             self._metadata_request_context = context
         if pkg in self.npm_cache:
             if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
-                return self.npm_cache[pkg]
+                return self.npm_cache[pkg], durable
             self.npm_cache.pop(pkg, None)
         if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
             # C2: planning packument cache -- merge latest/version/engines/
@@ -3064,7 +3072,7 @@ class LiveDataClient:
             if cached is not None and valid_registry_packument_shape(cached):
                 self.npm_cache[pkg] = cached
                 self._metadata_cache_disk_hits += 1
-                return cached
+                return cached, True
             self._metadata_cache_disk_misses += 1
         self.progress(operation="registry metadata", package=pkg, step="scan")
         encoded = pkg.replace("/", "%2F")
@@ -3084,18 +3092,30 @@ class LiveDataClient:
                                                      **({"headers": conditional} if conditional else {}),
                                                      **({} if self.allow_registry_metadata_redirects else {"allow_redirects": False}))
                 )
+                hops = (*getattr(response, "history", ()), response)
+                reusable = (durable and request_context(self.session, self.registry, self.metadata_cache_tool_version)
+                            == (context, True) and not any(
+                                key.lower() == "set-cookie" or (
+                                    key.lower() == "cache-control" and any(
+                                        directive.strip().partition("=")[0].strip().lower() == "no-store"
+                                        for directive in value.split(",")
+                                    )
+                                )
+                                for hop in hops for key, value in getattr(hop, "headers", {}).items()
+                            ))
                 status = int(getattr(response, "status_code", 0) or 0)
                 if status == 304 and stale is not None:
                     response.close()
                     data = stale["data"]
                     if not valid_registry_packument_shape(data):
                         raise ValueError("304 response has invalid cached registry packument")
-                    store_packument(self.metadata_cache_dir, self.registry, pkg, data,
-                                    self.metadata_cache_tool_version, context=context or "", validators=stale["validators"])
-                    self.npm_cache[pkg] = data
+                    if reusable:
+                        store_packument(self.metadata_cache_dir, self.registry, pkg, data,
+                                        self.metadata_cache_tool_version, context=context or "", validators=stale["validators"])
+                        self.npm_cache[pkg] = data
                     from verification_observability import emit_observability_event
                     emit_observability_event("planning.metadata.revalidated", status=304)
-                    return data
+                    return data, reusable
                 if status == 304:
                     response.close()
                     raise ValueError("registry returned 304 without a validated cached subject")
@@ -3106,14 +3126,16 @@ class LiveDataClient:
                     # A real 404 is a deterministic registry fact. Unlike a
                     # timeout/5xx it is safe to memoize as package absence.
                     response.close()
-                    self.npm_cache[pkg] = None
-                    return None
+                    if not durable or reusable:
+                        self.npm_cache[pkg] = None
+                    return None, reusable
                 response.raise_for_status()
                 data = self._bounded_json(response)
                 if not valid_registry_packument_shape(data):
                     raise ValueError("registry packument has invalid versions/dist-tags/time/dist shape")
-                self.npm_cache[pkg] = data
-                if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
+                if not durable or reusable:
+                    self.npm_cache[pkg] = data
+                if reusable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
                     # Best-effort; a cache write failure never aborts the run.
                     store_packument(
                         self.metadata_cache_dir, self.registry, pkg, data,
@@ -3121,14 +3143,13 @@ class LiveDataClient:
                         validators={key: response.headers[key] for key in ("ETag", "Last-Modified") if key in getattr(response, "headers", {})},
                     )
                 self._bounded_sleep(self.sleep_sec)
-                return data
+                return data, reusable
             except DraftBudgetExceeded:
                 raise
             except requests.HTTPError as exc:
                 status = int(getattr(exc.response, "status_code", 0) or 0)
                 if status == 404:
-                    self.npm_cache[pkg] = None
-                    return None
+                    return None, False
                 last_error = f"HTTP {status or 'unknown'}: {exc}"
                 if 400 <= status < 500 and status != 429:
                     break
@@ -3188,7 +3209,7 @@ class LiveDataClient:
 
         return self._supervised(lambda: query_registry_advisories(
             self.session, self.registry, approved_registry, pairs,
-            matches=matches, timeout=self._budgeted_timeout(), trust_omitted_packages=True,
+            matches=matches, timeout=self._budgeted_timeout(),
             max_match_evaluations=max_match_evaluations,
         ))
 
@@ -4797,8 +4818,8 @@ def _prefetch_draft_registry_window(
     def fetch(name: str) -> Any:
         worker = _registry_prefetch_client(client)
         try:
-            metadata = worker.fetch_npm_metadata(name)
-            return metadata, bool(worker.session.cookies)
+            metadata, reusable = worker._fetch_npm_metadata_result(name)
+            return metadata, not reusable
         finally:
             worker.session.close()
 

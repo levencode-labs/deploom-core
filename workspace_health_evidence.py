@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from typing import Iterable, Mapping
@@ -31,6 +32,7 @@ def collect_workspace_health_facts(
 
     if type(lag_months) is not int or lag_months not in {3, 6, 9, 12}:
         raise ValueError("INVALID_WORKSPACE_LAG_MONTHS")
+    observed_at = datetime.now(timezone.utc)
     facts = {}
     rows = []
     skipped_names = 0
@@ -64,7 +66,9 @@ def collect_workspace_health_facts(
         for version in candidates:
             observed = version_date(meta, version)
             lag_ok = None
-            if latest_date is not None and observed is not None:
+            if (latest_date is not None and observed is not None
+                    and latest_date.utcoffset() is not None and observed.utcoffset() is not None
+                    and max(latest_date, observed) <= observed_at):
                 try:
                     lag_ok = min_by_lag(meta, [version], lag_months, latest_override=latest) == version
                 except TypeError:  # mixed aware/naive timestamps do not establish order

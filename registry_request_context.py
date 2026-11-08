@@ -21,6 +21,8 @@ def request_context(session, url: str, tool_version: str = "") -> tuple[str | No
         parts = urlsplit(url)
         cookies = [(c.domain, c.path, c.name, c.value, c.secure, c.expires) for c in session.cookies]
         payload = {"url": prepared.url, "headers": headers, "cookies": cookies, "transport": settings, "redirects": session.max_redirects, "tool": tool_version}
+        # Pre-guard entries may have been populated by a stateful response.
+        payload["cachePolicy"] = "public-response-v3"
         key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         private_proxy = any(urlsplit(str(value)).username for value in settings.get("proxies", {}).values() if value)
     except Exception:

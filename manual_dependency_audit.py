@@ -264,7 +264,7 @@ def _npm_alias_target(name: str, spec: str) -> str:
     return target[:boundary] if boundary > 0 else target
 
 
-def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
+def canonical_yarn_inventory(project: Path, *, lock_path: Path | None = None) -> Dict[str, Any]:
     """Build the reachable package/version inventory selected by Yarn Classic.
 
     The result is suitable for npm's bulk security endpoint: it contains exact
@@ -274,7 +274,7 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
     than silently claiming a complete vulnerability audit.
     """
     from yarn_berry import owning_yarn_lock
-    lock_path = owning_yarn_lock(project)
+    lock_path = lock_path if lock_path is not None else owning_yarn_lock(project)
     entries = parse_yarn_lock_entries(lock_path)
     from yarn_berry import is_berry_lock
     modern = is_berry_lock(lock_path)
@@ -381,7 +381,7 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
 
 
 def yarn_classic_finding_roots(
-    project: Path, affected: set[Tuple[str, str]], *, max_paths: int = 4,
+    project: Path, affected: set[Tuple[str, str]], *, max_paths: int = 4, lock_path: Path | None = None,
 ) -> Dict[str, Any]:
     """Find one exact lockfile witness per direct declaration for affected versions.
 
@@ -392,7 +392,7 @@ def yarn_classic_finding_roots(
     from collections import deque
     from yarn_berry import owning_yarn_lock, registry_identity
 
-    lock_path = owning_yarn_lock(project)
+    lock_path = lock_path if lock_path is not None else owning_yarn_lock(project)
     entries = parse_yarn_lock_entries(lock_path)
     by_selector: Dict[str, int] = {}
     duplicates = set()

@@ -18,6 +18,11 @@ def _edges(packages: dict, consumer: str) -> dict:
     edges = {}
     for section in (*INSTALL_SECTIONS, "peerDependencies"):
         for name, spec in entry.get(section, {}).items():
+            # Match Arborist and the preflight peer check when an installed edge shadows a peer.
+            if section == "peerDependencies" and any(
+                name in entry.get(installed, {}) for installed in ("dependencies", "optionalDependencies")
+            ):
+                continue
             context = peer_context(consumer) if section == "peerDependencies" else consumer
             provider = npm_lock_resolved_instance(packages, name, context)
             edges[section, name] = (spec, provider)
@@ -86,6 +91,43 @@ def _equivalent_relocations(before, after, before_edges, after_edges):
                 if (old_spec, old_provider) != (new_spec, new_provider):
                     return {}
     return moves
+
+
+def _check_held_graph(before, after, before_edges, after_edges, owners, authorized, moves):
+    """Preserve the closure of every declaration outside the authorized delta."""
+    new_path = {old: new for new, old in moves.items()}
+    pending = deque((owner, True) for owner in sorted(owners))
+    visited = set()
+    while pending:
+        consumer, owner_seed = pending.popleft()
+        if not owner_seed:
+            if consumer in visited:
+                continue
+            visited.add(consumer)
+        left = before_edges[consumer]
+        right = after_edges[new_path.get(consumer, consumer)]
+        for section, name in sorted(left.keys() | right.keys()):
+            if owner_seed and (consumer or ".", section, name) in authorized:
+                continue
+            old_spec, old_provider = left.get((section, name), (None, None))
+            new_spec, new_provider = right.get((section, name), (None, None))
+            normalized = (moves.get(new_provider[0], new_provider[0]), new_provider[1]) if new_provider else None
+            if (old_spec, old_provider) != (new_spec, normalized):
+                return {"status": "RESOLUTION_FAILED", "code": "HELD_LOCK_PROVIDER_CHANGED",
+                        "path": consumer, "dependency": name, "section": section}
+            if old_provider is None:
+                continue
+            old_entry = before[old_provider[0]]
+            if _artifact(old_entry) != _artifact(after[new_provider[0]]):
+                return {"status": "RESOLUTION_FAILED", "code": "HELD_LOCK_TRANSITIVE_ARTIFACT_CHANGED",
+                        "path": consumer, "dependency": name, "section": section}
+            if old_entry.get("link"):
+                target = old_entry["resolved"].replace("\\", "/").strip("/")
+            else:
+                target = old_provider[0]
+            if target not in visited:
+                pending.append((target, False))
+    return None
 
 
 def check_workspace_lock_delta(
@@ -167,6 +209,10 @@ def check_workspace_lock_delta(
     if outside:
         return {"status": "RESOLUTION_FAILED", "code": "LOCK_UNRELATED_NODE_DELTA",
                 "path": outside[0], "unrelatedCount": len(outside)}
+
+    held_failure = _check_held_graph(before, after, before_edges, after_edges, owners, seeds, moves)
+    if held_failure is not None:
+        return held_failure
 
     edge_changes = 0
     inverse = {old: new for new, old in moves.items()}

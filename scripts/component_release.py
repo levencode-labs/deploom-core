@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-REPOSITORIES={'deploom-core':'DepLoom/core','deploom-mcp':'DepLoom/mcp'}
+REPOSITORIES={'deploom-core':'levencode-labs/deploom-core','deploom-mcp':'levencode-labs/deploom-mcp'}
 VERSION=re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+$')
 class ReleaseError(RuntimeError):pass
 
