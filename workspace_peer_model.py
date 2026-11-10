@@ -516,6 +516,8 @@ def plan_workspace_from_registry(
     environment: Mapping[str, str] | None = None,
     topology: WorkspaceTopology | None = None,
     candidate_limit: int = 32,
+    prefetch_metadata: bool = False,
+    bounded_selection: bool = False,
     timeout_ms: int = 30_000,
     candidate_versions: Mapping[Declaration, tuple[str, ...]] | None = None,
     health_policy: WorkspaceHealthPolicy | None = None,
@@ -532,8 +534,10 @@ def plan_workspace_from_registry(
 
     if not approved_lines.keys() <= declarations.keys() or not exact_targets.keys() <= approved_lines.keys():
         raise ValueError("EXACT_OR_MUTABLE_TARGET_OUTSIDE_DECLARATIONS")
-    if not 1 <= candidate_limit <= 128:
+    if type(candidate_limit) is not int or not 1 <= candidate_limit <= 128:
         raise ValueError("INVALID_WORKSPACE_CANDIDATE_LIMIT")
+    if bounded_selection and candidate_versions is not None:
+        raise ValueError("WORKSPACE_SELECTION_CONFLICT")
     if candidate_versions is not None and (
             candidate_versions.keys() != approved_lines.keys()
             or any(not 1 <= len(versions) <= candidate_limit or len(versions) != len(set(versions))
@@ -564,6 +568,9 @@ def plan_workspace_from_registry(
     packuments = {}
     admitted = {}
     candidate_evidence_errors = {}
+    selection_truncated = False
+    slots = {}
+    # Validate the entire local boundary before sending any package name.
     for key in sorted(declarations):
         owner, _, name = key
         current = npm_lock_resolved_instance(packages, name, "" if owner == "." else owner)
@@ -574,14 +581,23 @@ def plan_workspace_from_registry(
             if key in approved_lines:
                 raise ValueError(f"WORKSPACE_LINK_TARGET_NOT_MUTABLE: {key}")
             continue
+        slots[key] = current
+    if prefetch_metadata:
+        from workspace_registry_metadata import fetch_workspace_packuments
+        try:
+            packuments = fetch_workspace_packuments(client, [key[2] for key in slots])
+        except (RegistryInfrastructureError, DraftBudgetExceeded):
+            return {**unknown, "reason": "WORKSPACE_METADATA_PREFETCH_UNAVAILABLE"}
+    for key, (path, current_version) in slots.items():
+        name = key[2]
         if name not in packuments:
             try:
                 packument = client.fetch_npm_metadata(name)
             except (RegistryInfrastructureError, DraftBudgetExceeded):
                 return {**unknown, "reason": f"REGISTRY_METADATA_UNAVAILABLE: {name}"}
-            if not isinstance(packument, dict) or not isinstance(packument.get("versions"), dict):
-                return {**unknown, "reason": f"REGISTRY_METADATA_UNAVAILABLE: {name}"}
             packuments[name] = packument
+        if not isinstance(packuments[name], dict) or not isinstance(packuments[name].get("versions"), dict):
+            return {**unknown, "reason": f"REGISTRY_METADATA_UNAVAILABLE: {name}"}
         if key not in approved_lines:
             continue
         packument = packuments[name]
@@ -590,7 +606,8 @@ def plan_workspace_from_registry(
         versions = ((exact_targets[key],) if key in exact_targets else
                     candidate_versions[key] if candidate_versions is not None else packument["versions"])
         for value in versions:
-            if value == current_version and key not in exact_targets:
+            if (value == current_version and key not in exact_targets
+                    and (not bounded_selection or Version(value).major in approved_lines[key])):
                 candidates.append(Version(value))
                 continue
             try:
@@ -607,9 +624,16 @@ def plan_workspace_from_registry(
             url = client.registry_tarball_url(packument, value)
             if url and client.registry_artifact_url_allowed(url):
                 candidates.append(version)
-            elif candidate_versions is not None or key in exact_targets:
+            elif candidate_versions is not None or key in exact_targets or bounded_selection:
                 candidates.append(version)
                 candidate_evidence_errors[key, value] = "CANDIDATE_ARTIFACT_ORIGIN_UNPROVEN"
+        if bounded_selection:
+            ranked = sorted(set(candidates), reverse=True)
+            selection_truncated |= len(ranked) > candidate_limit
+            candidates = ranked[:candidate_limit]
+            # Retain an admitted baseline as an alternative without exceeding K.
+            if current_semver in ranked and current_semver not in candidates:
+                candidates[-1] = current_semver
         if not candidates or len(candidates) > candidate_limit:
             return {**unknown, "reason": f"WORKSPACE_CANDIDATE_DOMAIN_UNAVAILABLE: {key}"}
         if candidate_versions is not None and len(candidates) != len(versions):
@@ -640,6 +664,20 @@ def plan_workspace_from_registry(
         candidate_evidence_errors=candidate_evidence_errors, prepare_only=prepare_only,
         excluded_assignments=excluded_assignments, include_constraint_evidence=include_constraint_evidence,
     )
+    if bounded_selection:
+        selected = [{"declaration": list(key), "versions": list(versions)} for key, versions in sorted(admitted.items())]
+        selection = {"rule": "LATEST_STABLE_PLUS_BASELINE_V1", "limit": candidate_limit,
+                     "truncated": selection_truncated, "proofScope": "SELECTED_DOMAIN_ONLY"}
+        def annotate(value):
+            value = deepcopy(value)
+            value.update(selectedCandidates=selected, candidateSelection=selection)
+            if "domain" in value:
+                value["domain"]["selection"] = "SERVER_BOUNDED"
+            return value
+        if isinstance(result, PreparedWorkspacePlan):
+            result = replace(result, result=annotate(result.result))
+        else:
+            result = annotate(result)
     if health_policy is not None:
         if isinstance(result, PreparedWorkspacePlan):
             result = replace(result, policy_evidence=deepcopy(evidence))
