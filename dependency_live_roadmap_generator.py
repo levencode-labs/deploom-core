@@ -3179,37 +3179,18 @@ class LiveDataClient:
         self, pairs: List[Tuple[str, str]], approved_registry: str, *,
         max_match_evaluations: int | None = None,
     ):
-        from draft_npm_preflight import _npm_command
+        from npm_semver_batch import match_npm_semver_many
         from registry_advisory_evidence import query_registry_advisories
 
-        semver_script = (
-            "const semver = require(process.argv[1]);"
-            "const [range, version] = JSON.parse(require('fs').readFileSync(0, 'utf8'));"
-            "const opts = {includePrerelease:true, loose:true};"
-            "if (semver.validRange(range, opts) === null) process.exit(2);"
-            "process.stdout.write(JSON.stringify(semver.satisfies(version, range, opts)));"
-        )
-        npm_runtime = None
-
-        def matches(spec: str, version: str) -> bool:
-            nonlocal npm_runtime
-            try:
-                if npm_runtime is None:
-                    node, npm = _npm_command()
-                    semver = Path(npm).resolve().parent.parent / "node_modules" / "semver"
-                    npm_runtime = [node, "-e", semver_script, str(semver)]
-                timeout = self._budgeted_timeout()
-                result = subprocess.run(
-                    npm_runtime, input=json.dumps([spec, version]), encoding="utf-8",
-                    capture_output=True, check=True, timeout=min(5, timeout[1] if isinstance(timeout, tuple) else timeout),
-                )
-                return json.loads(result.stdout)
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise ValueError("npm advisory range matching unavailable") from exc
+        def match_many(comparisons):
+            timeout = self._budgeted_timeout()
+            return match_npm_semver_many(
+                comparisons, timeout_seconds=timeout[1] if isinstance(timeout, tuple) else timeout,
+            )
 
         return self._supervised(lambda: query_registry_advisories(
             self.session, self.registry, approved_registry, pairs,
-            matches=matches, timeout=self._budgeted_timeout(),
+            match_many=match_many, timeout=self._budgeted_timeout(),
             max_match_evaluations=max_match_evaluations,
         ))
 

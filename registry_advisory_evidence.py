@@ -70,15 +70,17 @@ def query_registry_advisories(
     approved_registry: str,
     pairs: list[tuple[str, str]],
     *,
-    matches: Callable[[str, str], bool],
+    matches: Callable[[str, str], bool] | None = None,
+    match_many: Callable[[list[tuple[str, str]]], list[bool | None]] | None = None,
     timeout: tuple[float, float],
     trust_omitted_packages: bool = False,
     max_match_evaluations: int | None = None,
 ) -> dict[tuple[str, str], RegistryAdvisoryEvidence]:
     """Query one trusted registry. The host supplies approval and omission policy.
 
-    `matches(range, version)` must implement npm semver and raise ValueError
-    for unsupported ranges. Missing package keys are unknown unless the host
+    `matches(range, version)` or `match_many(pairs)` must implement npm semver.
+    A batch result has exactly one bool/None per comparison in the same order;
+    None denotes an unsupported range. Missing package keys are unknown unless the host
     has established that omission is the registry's negative response.
     """
     requested = tuple(dict.fromkeys(pairs))
@@ -126,59 +128,75 @@ def query_registry_advisories(
     timestamp = datetime.now(timezone.utc).isoformat()
     evidence = {}
     comparisons = {}
+    prepared = {}
+
+    def record_unknown(pair, reason):
+        evidence[pair] = RegistryAdvisoryEvidence(
+            "UNKNOWN", reason, response_sha256=digest, retrieved_at=timestamp)
+
+    # Validate and budget before invoking any evaluator. Preserve first-seen
+    # comparison order and deduplication across package/version pairs.
     for name, version in requested:
+        pair = name, version
         records = data.get(name)
         if name not in data and not trust_omitted_packages:
-            evidence[name, version] = RegistryAdvisoryEvidence(
-                "UNKNOWN", "COVERAGE_UNCONFIRMED", response_sha256=digest, retrieved_at=timestamp
-            )
+            record_unknown(pair, "COVERAGE_UNCONFIRMED")
             continue
         try:
-            matched = []
             if name not in data:
                 records = []
             if not isinstance(records, list):
                 raise ValueError("invalid advisory list")
             if max_match_evaluations is not None and len(records) > max_match_evaluations:
-                evidence[name, version] = RegistryAdvisoryEvidence(
-                    "UNKNOWN", "MATCH_BUDGET_EXHAUSTED", response_sha256=digest, retrieved_at=timestamp
-                )
+                record_unknown(pair, "MATCH_BUDGET_EXHAUSTED")
                 continue
+            parsed = []
             for record in records:
                 if not isinstance(record, dict) or record.get("name", name) != name:
                     raise ValueError("invalid advisory package")
-                identifier = record.get("id")
-                severity = record.get("severity")
-                spec = record.get("vulnerable_versions")
+                identifier, severity, spec = (record.get(field) for field in ("id", "severity", "vulnerable_versions"))
                 if (type(identifier) not in (int, str) or not str(identifier).strip()
                         or not isinstance(severity, str) or severity not in _SEVERITIES
                         or not isinstance(spec, str) or not spec.strip()):
                     raise ValueError("invalid advisory fields")
-                key = (spec, version)
+                key = spec, version
                 if key not in comparisons:
                     if max_match_evaluations is not None and len(comparisons) >= max_match_evaluations:
-                        evidence[name, version] = RegistryAdvisoryEvidence(
-                            "UNKNOWN", "MATCH_BUDGET_EXHAUSTED", response_sha256=digest, retrieved_at=timestamp
-                        )
+                        record_unknown(pair, "MATCH_BUDGET_EXHAUSTED")
                         break
-                    try:
-                        comparisons[key] = matches(spec, version)
-                    except ValueError:
-                        comparisons[key] = None
-                applies = comparisons[key]
-                if type(applies) is not bool:
-                    raise ValueError("unknown advisory range")
-                if applies:
-                    matched.append(RegistryAdvisory(str(identifier), severity, spec))
+                    comparisons[key] = None
+                parsed.append(RegistryAdvisory(str(identifier), severity, spec))
+            if pair not in evidence:
+                prepared[pair] = parsed
         except ValueError:
-            evidence[name, version] = RegistryAdvisoryEvidence(
-                "UNKNOWN", "INVALID_ADVISORY_OR_RANGE", response_sha256=digest, retrieved_at=timestamp
-            )
-        else:
-            if (name, version) in evidence:
-                continue
-            evidence[name, version] = RegistryAdvisoryEvidence(
-                "AFFECTED" if matched else "NO_REPORTED_ADVISORIES",
-                "REGISTRY_EXACT_VERSION", tuple(dict.fromkeys(matched)), digest, timestamp,
-            )
-    return evidence
+            record_unknown(pair, "INVALID_ADVISORY_OR_RANGE")
+
+    if comparisons and match_many is not None:
+        keys = list(comparisons)
+        try:
+            outcomes = match_many(keys)
+            if (not isinstance(outcomes, list) or len(outcomes) != len(keys)
+                    or any(value is not None and type(value) is not bool for value in outcomes)):
+                raise ValueError("invalid batch range response")
+            comparisons.update(zip(keys, outcomes, strict=True))
+        except ValueError:
+            pass  # The complete batch remains unknown; never fall back to clean.
+    elif comparisons:
+        for spec, version in comparisons:
+            try:
+                if matches is None:
+                    raise ValueError("npm range matcher missing")
+                comparisons[spec, version] = matches(spec, version)
+            except ValueError:
+                pass
+
+    for (name, version), records in prepared.items():
+        if any(type(comparisons[record.vulnerable_range, version]) is not bool for record in records):
+            record_unknown((name, version), "INVALID_ADVISORY_OR_RANGE")
+            continue
+        matched = tuple(dict.fromkeys(record for record in records if comparisons[record.vulnerable_range, version]))
+        evidence[name, version] = RegistryAdvisoryEvidence(
+            "AFFECTED" if matched else "NO_REPORTED_ADVISORIES",
+            "REGISTRY_EXACT_VERSION", matched, digest, timestamp,
+        )
+    return {pair: evidence[pair] for pair in requested}

@@ -11,7 +11,7 @@ class RegistryAdvisoryEvidenceTests(unittest.TestCase):
     registry = "https://registry.example.test/repository/npm-group"
     advisory = {"id": 12, "name": "sample", "severity": "high", "vulnerable_versions": "<2.0.0"}
 
-    def query(self, body, *, status=200, trust_omissions=False, registry=None, match_limit=None):
+    def query(self, body, *, status=200, trust_omissions=False, registry=None, match_limit=None, match_many=None):
         self.session = MagicMock()
         response = self.session.post.return_value.__enter__.return_value
         response.status_code = status
@@ -20,6 +20,7 @@ class RegistryAdvisoryEvidenceTests(unittest.TestCase):
             self.session, self.registry if registry is None else registry, self.registry,
             [("sample", "1.0.0"), ("sample", "2.0.0"), ("missing", "1.0.0")],
             matches=lambda spec, version: NpmSpec(spec).match(Version(version)),
+            match_many=match_many,
             timeout=(1.0, 2.0), trust_omitted_packages=trust_omissions, max_match_evaluations=match_limit,
         )
 
@@ -60,3 +61,26 @@ class RegistryAdvisoryEvidenceTests(unittest.TestCase):
     def test_duplicate_fields_never_become_empty_evidence(self):
         body = b'{"sample": [], "sample": []}'
         self.assertTrue(all(x.reason == "INVALID_ADVISORY_RESPONSE" for x in self.query(body).values()))
+
+    def test_batch_preserves_findings_coverage_and_global_budget(self):
+        from unittest.mock import Mock
+        batch = Mock(side_effect=lambda pairs: [NpmSpec(spec).match(Version(version)) for spec, version in pairs])
+        result = self.query({'sample': [self.advisory]}, match_many=batch)
+        batch.assert_called_once_with([('<2.0.0', '1.0.0'), ('<2.0.0', '2.0.0')])
+        self.assertEqual(result['sample', '1.0.0'].status, 'AFFECTED')
+        self.assertEqual(result['sample', '2.0.0'].status, 'NO_REPORTED_ADVISORIES')
+        self.assertEqual(result['missing', '1.0.0'].reason, 'COVERAGE_UNCONFIRMED')
+        batch.reset_mock()
+        limited = self.query({'sample': [self.advisory]}, match_many=batch, match_limit=1)
+        batch.assert_called_once_with([('<2.0.0', '1.0.0')])
+        self.assertEqual(limited['sample', '2.0.0'].reason, 'MATCH_BUDGET_EXHAUSTED')
+
+    def test_batch_protocol_failure_or_unknown_never_certifies_clean(self):
+        for outcomes in ([], [True], [False, 'false'], [None, None], {'result': False}):
+            with self.subTest(outcomes=outcomes):
+                result = self.query({'sample': [self.advisory]}, match_many=lambda _: outcomes)
+                self.assertEqual(result['sample', '1.0.0'].status, 'UNKNOWN')
+                self.assertEqual(result['sample', '2.0.0'].status, 'UNKNOWN')
+        partial = self.query({'sample': [self.advisory]}, match_many=lambda _: [True, None])
+        self.assertEqual(partial['sample', '1.0.0'].status, 'AFFECTED')
+        self.assertEqual(partial['sample', '2.0.0'].status, 'UNKNOWN')
