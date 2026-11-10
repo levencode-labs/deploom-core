@@ -6,7 +6,8 @@ bindings are assumptions of the model, not a prediction of npm placement.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, replace
+from hashlib import sha256
+from dataclasses import asdict, dataclass, field, replace
 from typing import Mapping
 
 from semantic_version import NpmSpec, Version
@@ -28,6 +29,7 @@ class WorkspaceCandidate:
     peers: Mapping[str, str]
     optional_peers: frozenset[str] = frozenset()
     engines: Mapping[str, str] = field(default_factory=dict)
+    evidence_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,11 +118,14 @@ def compile_workspace_peer_model(
     providers: Mapping[tuple[Declaration, str], Declaration | LockedWorkspacePeer | None],
     *,
     environment: Mapping[str, str] | None = None,
+    unknown_candidates: list[dict] | None = None,
 ) -> PeerOptimizationModel:
     """Build existing solver IR, failing closed for absent provider evidence.
 
     A missing binding is unknown. An explicit None represents absence in the
-    modeled topology and only satisfies an optional peer.
+    modeled topology and only satisfies an optional peer. When an evidence
+    collector is supplied, unknown candidate literals are blocked in the proven
+    submodel and reported without shrinking domains or changing preferences.
     """
     selected = {}
     variables = []
@@ -147,58 +152,73 @@ def compile_workspace_peer_model(
     for key, candidates in selected.items():
         for candidate in candidates:
             trigger = (declaration_id(key), candidate.version)
-            for engine, spec in sorted(candidate.engines.items()):
-                if engine not in {"node", "npm"}:
-                    continue
-                if environment is None or engine not in environment:
-                    raise WorkspaceModelUnknown(f"ENGINE_VERSION_UNKNOWN: {key} -> {engine}")
-                try:
-                    matches = NpmSpec(normalize_npm_range(spec)).match(Version(environment[engine]))
-                except ValueError as exc:
-                    raise WorkspaceModelUnknown(f"ENGINE_RANGE_UNSUPPORTED: {key} -> {engine}: {spec}") from exc
-                if not matches:
-                    forbidden_constraints.append(forbidden(
-                        (trigger,), reason=f"{key}@{candidate.version} requires {engine}@{spec}",
-                        provenance="workspace-modeled-engine-range",
-                    ))
-            for peer, spec in sorted(candidate.peers.items()):
-                binding = (key, peer)
-                if binding not in providers:
-                    raise WorkspaceModelUnknown(f"PEER_PROVIDER_UNKNOWN: {key}@{candidate.version} -> {peer}")
-                provider = providers[binding]
-                if isinstance(provider, LockedWorkspacePeer):
+            try:
+                if candidate.evidence_reason:
+                    raise WorkspaceModelUnknown(candidate.evidence_reason)
+                for engine, spec in sorted(candidate.engines.items()):
+                    if engine not in {"node", "npm"}:
+                        continue
+                    if environment is None or engine not in environment:
+                        raise WorkspaceModelUnknown(f"ENGINE_VERSION_UNKNOWN: {key} -> {engine}")
                     try:
-                        matches = NpmSpec(normalize_npm_range(spec)).match(Version(provider.version))
+                        matches = NpmSpec(normalize_npm_range(spec)).match(Version(environment[engine]))
                     except ValueError as exc:
-                        raise WorkspaceModelUnknown(f"PEER_RANGE_UNSUPPORTED: {key} -> {peer}: {spec}") from exc
+                        raise WorkspaceModelUnknown(f"ENGINE_RANGE_UNSUPPORTED: {key} -> {engine}: {spec}") from exc
                     if not matches:
                         forbidden_constraints.append(forbidden(
-                            (trigger,), reason=f"{key}@{candidate.version} requires {peer}@{spec}; "
-                                              f"observed transitive version is {provider.version}",
-                            provenance="workspace-observed-transitive-peer",
+                            (trigger,), reason=f"{key}@{candidate.version} requires {engine}@{spec}",
+                            provenance="workspace-modeled-engine-range",
                         ))
-                    continue
-                if provider is None:
-                    if peer in candidate.optional_peers:
+                for peer, spec in sorted(candidate.peers.items()):
+                    binding = (key, peer)
+                    if binding not in providers:
+                        raise WorkspaceModelUnknown(f"PEER_PROVIDER_UNKNOWN: {key}@{candidate.version} -> {peer}")
+                    provider = providers[binding]
+                    if isinstance(provider, LockedWorkspacePeer):
+                        try:
+                            matches = NpmSpec(normalize_npm_range(spec)).match(Version(provider.version))
+                        except ValueError as exc:
+                            raise WorkspaceModelUnknown(f"PEER_RANGE_UNSUPPORTED: {key} -> {peer}: {spec}") from exc
+                        if not matches:
+                            forbidden_constraints.append(forbidden(
+                                (trigger,), reason=f"{key}@{candidate.version} requires {peer}@{spec}; "
+                                                  f"observed transitive version is {provider.version}",
+                                provenance="workspace-observed-transitive-peer",
+                            ))
                         continue
-                    # An empty requirement against the trigger's own variable
-                    # makes this exact candidate infeasible.
-                    provider, allowed = key, ()
-                else:
-                    if provider not in selected:
-                        raise WorkspaceModelUnknown(f"PEER_PROVIDER_OUTSIDE_MODEL: {key} -> {peer}")
-                    if provider[2] != peer:
-                        raise ValueError(f"PEER_PROVIDER_NAME_MISMATCH: {key} -> {peer}")
-                    try:
-                        npm_range = NpmSpec(normalize_npm_range(spec))
-                        allowed = tuple(item.version for item in selected[provider]
-                                        if npm_range.match(Version(item.version)))
-                    except ValueError as exc:
-                        raise WorkspaceModelUnknown(f"PEER_RANGE_UNSUPPORTED: {key} -> {peer}: {spec}") from exc
-                requirements.append(RequiresAny(
-                    trigger, declaration_id(provider), allowed,
-                    reason=f"{key}@{candidate.version} requires {peer}@{spec} via {provider}",
-                    provenance="workspace-modeled-peer-range",
+                    if provider is None:
+                        if peer in candidate.optional_peers:
+                            continue
+                        # An empty requirement against the trigger's own variable
+                        # makes this exact candidate infeasible.
+                        provider, allowed = key, ()
+                    else:
+                        if provider not in selected:
+                            raise WorkspaceModelUnknown(f"PEER_PROVIDER_OUTSIDE_MODEL: {key} -> {peer}")
+                        if provider[2] != peer:
+                            raise ValueError(f"PEER_PROVIDER_NAME_MISMATCH: {key} -> {peer}")
+                        try:
+                            npm_range = NpmSpec(normalize_npm_range(spec))
+                            allowed = tuple(item.version for item in selected[provider]
+                                            if npm_range.match(Version(item.version)))
+                        except ValueError as exc:
+                            raise WorkspaceModelUnknown(f"PEER_RANGE_UNSUPPORTED: {key} -> {peer}: {spec}") from exc
+                    requirements.append(RequiresAny(
+                        trigger, declaration_id(provider), allowed,
+                        reason=f"{key}@{candidate.version} requires {peer}@{spec} via {provider}",
+                        provenance="workspace-modeled-peer-range",
+                    ))
+            except WorkspaceModelUnknown as exc:
+                if unknown_candidates is None:
+                    raise
+                unknown_candidates.append({
+                    "owner": key[0], "section": key[1], "name": key[2],
+                    "version": candidate.version, "reason": str(exc),
+                })
+                # Keep original domains/ranks and all variables. Only this
+                # evidence-deficient literal is unavailable in the proven model.
+                forbidden_constraints.append(forbidden(
+                    (trigger,), reason=str(exc), provenance="workspace-candidate-evidence-unknown",
                 ))
     return PeerOptimizationModel(tuple(variables), constraints=tuple(forbidden_constraints),
                                  requirements=tuple(requirements), objective_width=2)
@@ -210,6 +230,8 @@ def workspace_domains_from_inputs(
     admitted_versions: Mapping[Declaration, tuple[str, ...]],
     exact_targets: Mapping[Declaration, str],
     packuments: Mapping[str, dict],
+    *,
+    allow_partial: bool = False,
 ) -> dict[Declaration, WorkspaceDomain]:
     """Bind admitted candidate metadata and lock versions to declaration owners.
 
@@ -240,20 +262,25 @@ def workspace_domains_from_inputs(
 
         candidates = []
         for choice in choices:
-            item = metadata.get(choice)
-            if not isinstance(item, dict) or item.get("version") != choice:
-                raise WorkspaceModelUnknown(f"CANDIDATE_METADATA_MISSING: {key}@{choice}")
-            if not entry.get("link") and item.get("name") != name:
-                raise WorkspaceModelUnknown(f"CANDIDATE_METADATA_IDENTITY_MISMATCH: {key}@{choice}")
-            peers = item.get("peerDependencies", {})
-            peer_meta = item.get("peerDependenciesMeta", {})
-            engines = item.get("engines", {})
-            if (not all(isinstance(value, dict) for value in (peers, peer_meta, engines))
-                    or any(not isinstance(value, str) for value in (*peers.values(), *engines.values()))
-                    or any(not isinstance(value, dict) for value in peer_meta.values())):
-                raise WorkspaceModelUnknown(f"CANDIDATE_METADATA_INVALID: {key}@{choice}")
-            optional = frozenset(peer for peer, flags in peer_meta.items() if flags.get("optional") is True)
-            candidates.append(WorkspaceCandidate(choice, peers, optional, engines))
+            try:
+                item = metadata.get(choice)
+                if not isinstance(item, dict) or item.get("version") != choice:
+                    raise WorkspaceModelUnknown(f"CANDIDATE_METADATA_MISSING: {key}@{choice}")
+                if not entry.get("link") and item.get("name") != name:
+                    raise WorkspaceModelUnknown(f"CANDIDATE_METADATA_IDENTITY_MISMATCH: {key}@{choice}")
+                peers = item.get("peerDependencies", {})
+                peer_meta = item.get("peerDependenciesMeta", {})
+                engines = item.get("engines", {})
+                if (not all(isinstance(value, dict) for value in (peers, peer_meta, engines))
+                        or any(not isinstance(value, str) for value in (*peers.values(), *engines.values()))
+                        or any(not isinstance(value, dict) for value in peer_meta.values())):
+                    raise WorkspaceModelUnknown(f"CANDIDATE_METADATA_INVALID: {key}@{choice}")
+                optional = frozenset(peer for peer, flags in peer_meta.items() if flags.get("optional") is True)
+                candidates.append(WorkspaceCandidate(choice, peers, optional, engines))
+            except WorkspaceModelUnknown as exc:
+                if not allow_partial:
+                    raise
+                candidates.append(WorkspaceCandidate(choice, {}, evidence_reason=str(exc)))
         domains[key] = WorkspaceDomain(version, tuple(candidates), mutable, exact)
     return domains
 
@@ -297,8 +324,11 @@ def plan_workspace_from_lock(
                         for candidate in domain.candidates
                     )
                     domains[key] = replace(domain, candidates=candidates)
+        unknown_candidates = []
         model = compile_workspace_peer_model(
-            domains, workspace_providers_from_lock(packages, domains), environment=environment)
+            domains, workspace_providers_from_lock(packages, domains), environment=environment,
+            unknown_candidates=unknown_candidates)
+        result["domain"] = _domain_evidence(model, unknown_candidates)
         variables = model.package_map()
         for path, keys in instances.items():
             if len(keys) > 1:
@@ -333,7 +363,10 @@ def plan_workspace_in_topology(
             or any(not group or len({key[2] for key in group}) != 1 for group in instance_groups)):
         return {**result, "status": "UNKNOWN", "reason": "WORKSPACE_INSTANCE_PARTITION_UNPROVEN"}
     try:
-        model = compile_workspace_peer_model(domains, providers, environment=environment)
+        unknown_candidates = []
+        model = compile_workspace_peer_model(domains, providers, environment=environment,
+                                             unknown_candidates=unknown_candidates)
+        result["domain"] = _domain_evidence(model, unknown_candidates)
     except WorkspaceModelUnknown as exc:
         return {**result, "status": "UNKNOWN", "reason": str(exc)}
 
@@ -386,7 +419,36 @@ def _constraint_evidence(model, domains):
             "rules": rules, "ruleCount": total}
 
 
+def _domain_evidence(model, unknown_candidates):
+    return {"schemaVersion": 1, "selection": "EXPLICIT_FINITE",
+            "evidenceCoverage": "PARTIAL" if unknown_candidates else "COMPLETE",
+            "candidateSetDigest": sha256(json.dumps(
+                [(item.name, item.current_version, item.domain) for item in model.packages],
+                separators=(",", ":"), ensure_ascii=True).encode()).hexdigest(),
+            "candidateCount": model.candidate_count(),
+            "unprovenCandidateCount": len(unknown_candidates),
+            "unprovenCandidates": unknown_candidates}
+
+
+def _finish_workspace_solution(result, *, health_evidence=False):
+    partial = result.get("domain", {}).get("evidenceCoverage") == "PARTIAL"
+    if partial and result["status"] == "UNSAT_IN_MODELED_DOMAIN":
+        result.update(status="UNKNOWN", assignment=None, reason="WORKSPACE_CANDIDATE_EVIDENCE_INCOMPLETE")
+        if "policy" in result:
+            result["policy"] = {**result["policy"], "status": "UNKNOWN"}
+    result["optimality"] = (
+        "PROVEN_IN_EVIDENCED_SUBDOMAIN" if partial or health_evidence else "PROVEN_IN_SELECTED_DOMAIN"
+    ) if result["status"] == "SAT_IN_MODELED_DOMAIN" else "NOT_PROVEN"
+    if result.get("assignment") is not None:
+        result["assignmentDigest"] = sha256(json.dumps(
+            result["assignment"], sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    return result
+
+
 def _solve_workspace_model(model, result, timeout_ms, excluded_assignments, constraint_evidence, health_solver):
+    result["modelDigest"] = sha256(json.dumps(
+        {"model": asdict(model), "topology": result["topology"]},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
     if constraint_evidence is not None:
         result["constraintEvidence"] = constraint_evidence
     if excluded_assignments:
@@ -396,13 +458,13 @@ def _solve_workspace_model(model, result, timeout_ms, excluded_assignments, cons
             for vector in excluded_assignments
         )
     if health_solver is not None:
-        return {**result, **health_solver(model, timeout_ms)}
+        return _finish_workspace_solution({**result, **health_solver(model, timeout_ms)}, health_evidence=True)
     solved = solve_z3_exact(model, timeout_ms=timeout_ms)
     if solved.status == "optimal" and solved.assignment is not None:
-        return {**result, "status": "SAT_IN_MODELED_DOMAIN", "assignment": solved.assignment}
+        return _finish_workspace_solution({**result, "status": "SAT_IN_MODELED_DOMAIN", "assignment": solved.assignment})
     if solved.status == "unsat":
-        return {**result, "status": "UNSAT_IN_MODELED_DOMAIN"}
-    return {**result, "status": "UNKNOWN", "reason": solved.detail or solved.status}
+        return _finish_workspace_solution({**result, "status": "UNSAT_IN_MODELED_DOMAIN"})
+    return _finish_workspace_solution({**result, "status": "UNKNOWN", "reason": solved.detail or solved.status})
 
 
 def plan_workspace_from_registry(
@@ -461,6 +523,7 @@ def plan_workspace_from_registry(
                              "authority": "DECLARED_DOMAIN_PLANNING_ONLY", "finalAudit": "NOT_RUN"}
     packuments = {}
     admitted = {}
+    candidate_evidence_errors = {}
     for key in sorted(declarations):
         owner, _, name = key
         current = npm_lock_resolved_instance(packages, name, "" if owner == "." else owner)
@@ -497,10 +560,16 @@ def plan_workspace_from_registry(
             if version.prerelease or version < current_semver or version.major not in approved_lines[key]:
                 continue
             if not isinstance(packument["versions"].get(value), dict):
+                if candidate_versions is not None or key in exact_targets:
+                    candidates.append(version)
+                    candidate_evidence_errors[key, value] = "CANDIDATE_METADATA_MISSING"
                 continue
             url = client.registry_tarball_url(packument, value)
             if url and client.registry_artifact_url_allowed(url):
                 candidates.append(version)
+            elif candidate_versions is not None or key in exact_targets:
+                candidates.append(version)
+                candidate_evidence_errors[key, value] = "CANDIDATE_ARTIFACT_ORIGIN_UNPROVEN"
         if not candidates or len(candidates) > candidate_limit:
             return {**unknown, "reason": f"WORKSPACE_CANDIDATE_DOMAIN_UNAVAILABLE: {key}"}
         if candidate_versions is not None and len(candidates) != len(versions):
@@ -528,6 +597,7 @@ def plan_workspace_from_registry(
         packages, declarations, admitted, exact_targets, packuments,
         environment=environment, topology=topology, timeout_ms=timeout_ms,
         health_policy=health_policy, health_facts=facts, effective_peer_ranges=effective_peer_ranges,
+        candidate_evidence_errors=candidate_evidence_errors,
         excluded_assignments=excluded_assignments, include_constraint_evidence=include_constraint_evidence,
     )
     if health_policy is not None:
@@ -550,6 +620,7 @@ def plan_workspace_upgrade(
     include_constraint_evidence: bool = False,
     health_policy: WorkspaceHealthPolicy | None = None,
     health_facts: Mapping[tuple[str, str], WorkspaceHealthFact] | None = None,
+    candidate_evidence_errors: Mapping[tuple[Declaration, str], str] | None = None,
     effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
 ) -> dict:
     """Use a bounded metadata snapshot to plan under the observed npm lock layout."""
@@ -557,7 +628,12 @@ def plan_workspace_upgrade(
         raise ValueError("WORKSPACE_HEALTH_FACTS_REQUIRE_POLICY")
     try:
         domains = workspace_domains_from_inputs(
-            packages, declarations, admitted_versions, exact_targets, packuments)
+            packages, declarations, admitted_versions, exact_targets, packuments, allow_partial=True)
+        for key, domain in list(domains.items()):
+            domains[key] = replace(domain, candidates=tuple(
+                replace(candidate, evidence_reason=(candidate_evidence_errors or {}).get(
+                    (key, candidate.version), candidate.evidence_reason)) for candidate in domain.candidates
+            ))
     except WorkspaceModelUnknown as exc:
         return {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
                 "topology": "PROPOSED_INSTANCE_LAYOUT" if topology else "OBSERVED_LOCK_LAYOUT", "status": "UNKNOWN",
