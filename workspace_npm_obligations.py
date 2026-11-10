@@ -43,6 +43,29 @@ def _owners(packages, hashes):
     return owners
 
 
+def supported_workspace_npmrc(raw):
+    # This setting changes how npm saves selectors, not how frozen ci resolves them.
+    return raw in (b"save-exact=true", b"save-exact=true\n", b"save-exact=true\r\n")
+
+
+def guard_workspace_npmrc(project, plan):
+    path = project / ".npmrc"
+    expected = plan.get("rootNpmrcSha256")
+    if not path.exists() and not path.is_symlink():
+        if expected is not None:
+            _fail("INSTALL_NPMRC_DRIFT")
+        return
+    if expected is None:
+        _fail("INSTALL_NPMRC_UNSUPPORTED")
+    info = path.lstat()
+    if (is_reparse(path) or getattr(info, "st_file_attributes", 0) & 0x400
+            or not path.is_file() or info.st_size > 32):
+        _fail("INSTALL_NPMRC_UNSUPPORTED")
+    raw = path.read_bytes()
+    if not supported_workspace_npmrc(raw) or _sha256_bytes(raw) != expected:
+        _fail("INSTALL_NPMRC_DRIFT")
+
+
 def compile_npm_workspace_obligations(baseline_lock, candidate_lock, candidate_manifests, resolver_record):
     """Use locally owned M3 evidence. A supplied digest alone grants no authority."""
     identity = resolver_record["identity"]
@@ -125,6 +148,11 @@ def compile_npm_workspace_obligations(baseline_lock, candidate_lock, candidate_m
                                     for path in before["packages"].keys() | packages.keys()
                                     if path not in owners and path not in links),
     }
+    if "rootNpmrcSha256" in identity:
+        config_sha = identity["rootNpmrcSha256"]
+        if not isinstance(config_sha, str) or not re.fullmatch(r"[a-f0-9]{64}", config_sha):
+            _fail("INSTALL_NPMRC_UNSUPPORTED")
+        plan["rootNpmrcSha256"] = config_sha
     return {**plan, "obligationPlanDigest": _canonical_hash(plan)}
 
 
@@ -143,6 +171,7 @@ def guard_workspace_install_inputs(project, plan, lock_bytes):
             _fail("INSTALL_REPARSE_UNPROVEN")
         return True
 
+    guard_workspace_npmrc(project, plan)
     for owner, row in owners.items():
         directory = project
         for part in owner.split("/") if owner else ():
@@ -157,5 +186,5 @@ def guard_workspace_install_inputs(project, plan, lock_bytes):
         modules = directory / "node_modules"
         if ordinary(modules) and (not modules.is_dir() or any(modules.iterdir())):
             _fail("INSTALL_EXISTING_TREE_REQUIRES_RECOVERABLE_STAGING")
-        if ordinary(directory / ".npmrc"):
+        if owner and ordinary(directory / ".npmrc"):
             _fail("INSTALL_NPMRC_UNSUPPORTED")

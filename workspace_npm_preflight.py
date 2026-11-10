@@ -272,6 +272,7 @@ def run_workspace_npm_preflight(
     timeout_seconds: int = 60,
     reauthor: Declaration | None = None,
     immutable_instances: frozenset[str] = frozenset(),
+    root_npmrc: bytes | None = None,
 ) -> dict:
     """Check a hash-bound candidate with npm in an isolated, offline directory."""
     evidence = {"authority": "LOCKFILE_ONLY", "installation": "NOT_RUN", "runtime": "NOT_RUN",
@@ -279,6 +280,11 @@ def run_workspace_npm_preflight(
     if (not 1 <= timeout_seconds <= 60 or not 1 <= len(manifests) <= 256
             or "." not in manifests or not mutable <= assignment.keys()):
         return {**evidence, "status": "UNKNOWN", "code": "INVALID_WORKSPACE_PREFLIGHT_INPUT"}
+
+    if root_npmrc is not None:
+        from workspace_npm_obligations import supported_workspace_npmrc
+        if not supported_workspace_npmrc(root_npmrc):
+            return {**evidence, "status": "UNKNOWN", "code": "WORKSPACE_PREFLIGHT_PROJECT_NPMRC_UNSUPPORTED"}
 
     try:
         projects = {owner: json.loads(raw) for owner, raw in manifests.items()}
@@ -377,6 +383,8 @@ def run_workspace_npm_preflight(
             candidate_manifests[path] = raw
         lock_path = workspace / "package-lock.json"
         lock_path.write_bytes(baseline_lock)
+        if root_npmrc is not None:
+            (workspace / ".npmrc").write_bytes(root_npmrc)
         node, npm_cli = _workspace_npm_command()
         user_config = workspace / "user.npmrc"
         global_config = workspace / "global.npmrc"
@@ -396,6 +404,8 @@ def run_workspace_npm_preflight(
             "reauthor": list(reauthor) if reauthor is not None else None,
             "registrySha256": hashlib.sha256(registry.encode()).hexdigest(),
         }
+        if root_npmrc is not None:
+            identity["rootNpmrcSha256"] = hashlib.sha256(root_npmrc).hexdigest()
         has_overrides = bool(projects["."].get("overrides"))
         if has_overrides:
             identity["peerEvidenceMethod"] = "NPM_EFFECTIVE_VIRTUAL_EDGES"
@@ -491,7 +501,8 @@ def run_workspace_npm_preflight(
                 else:
                     exit_code, code = resolve("reauthor-restore")
                     result = check(exit_code, code)
-        if any(path.read_bytes() != raw for path, raw in candidate_manifests.items()):
+        if (any(path.read_bytes() != raw for path, raw in candidate_manifests.items())
+                or root_npmrc is not None and (workspace / ".npmrc").read_bytes() != root_npmrc):
             result = {"status": "UNKNOWN", "code": "CANDIDATE_MANIFEST_CHANGED"}
         if result["status"] == "RESOLUTION_PASSED":
             delta = check_workspace_lock_delta(

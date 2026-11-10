@@ -82,7 +82,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         fail('CURRENT_WORKSPACE_PROFILE_UNPROVEN')
     if not has_guaranteed_tree_backend():
         fail('CURRENT_WORKSPACE_PROCESS_CLOSURE_UNAVAILABLE')
-    from workspace_npm_obligations import WORKSPACE_OBLIGATION_KIND, guard_workspace_install_inputs
+    from workspace_npm_obligations import WORKSPACE_OBLIGATION_KIND, guard_workspace_install_inputs, guard_workspace_npmrc
     from workspace_npm_preflight import WORKSPACE_NPM_POLICY, isolated_workspace_npm_environment
     workspace_mode = dependency_plan.get("kind") == WORKSPACE_OBLIGATION_KIND
     project=Path(project_dir).absolute();cache=Path(cache_dir).absolute()
@@ -185,6 +185,8 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
                 'environmentDigest':project_environment_fingerprint(env,contract=environment_contract),
                 'toolchain':tools,'buildCommandDigest':_sha(commands[0].encode())}
         def source_guard():
+            if workspace_mode and "rootNpmrcSha256" in dependency_plan:
+                guard_workspace_npmrc(project, dependency_plan)
             remaining();validate_source_snapshot(snapshot,timeout_seconds=remaining())
             if (not source_snapshot_live_source_continuity(snapshot,timeout_seconds=remaining())
                     or (project/'package-lock.json').read_bytes()!=lock

@@ -102,6 +102,29 @@ class WorkspacePhysicalTests(unittest.TestCase):
             guard_workspace_install_inputs(self.root, plan, self.lock)
         self.assertEqual(nested.read_bytes(), original)
 
+    def test_frozen_install_requires_exact_bound_root_npmrc(self):
+        for location in ("node_modules/react", "apps/a/node_modules/react"):
+            (self.root / location / "package.json").unlink()
+            (self.root / location).rmdir()
+        config = self.root / ".npmrc"
+        config.write_bytes(b"save-exact=true\n")
+        unbound = compile_npm_workspace_obligations(self.lock, self.lock, self.manifests, self.record)
+        with self.assertRaisesRegex(MaterializedDependencyObligationError, "INSTALL_NPMRC_UNSUPPORTED"):
+            guard_workspace_install_inputs(self.root, unbound, self.lock)
+        self.identity["rootNpmrcSha256"] = digest(config.read_bytes())
+        self.record["receipt"]["resolverIdentitySha256"] = digest(encode(self.identity))
+        plan = compile_npm_workspace_obligations(self.lock, self.lock, self.manifests, self.record)
+        self.assertEqual(self.identity["rootNpmrcSha256"], plan["rootNpmrcSha256"])
+        guard_workspace_install_inputs(self.root, plan, self.lock)
+
+        for replacement in (b"save-exact=true\r\n", b"save-exact=false\n"):
+            config.write_bytes(replacement)
+            with self.assertRaisesRegex(MaterializedDependencyObligationError, "INSTALL_NPMRC_DRIFT"):
+                guard_workspace_install_inputs(self.root, plan, self.lock)
+        config.unlink()
+        with self.assertRaisesRegex(MaterializedDependencyObligationError, "INSTALL_NPMRC_DRIFT"):
+            guard_workspace_install_inputs(self.root, plan, self.lock)
+
     def test_receipt_is_bound_to_exact_candidate_lock(self):
         with self.assertRaisesRegex(MaterializedDependencyObligationError, "RESOLVER_EVIDENCE_UNBOUND"):
             compile_npm_workspace_obligations(self.lock, self.lock + b" ", self.manifests, self.record)
