@@ -6,7 +6,7 @@ from dependency_live_roadmap_generator import DeadlineClock, LiveDataClient, Reg
 from registry_advisory_evidence import RegistryAdvisory, RegistryAdvisoryEvidence
 from workspace_health_evidence import collect_workspace_health_facts
 from workspace_health_policy import WorkspaceHealthPolicy
-from workspace_peer_model import declaration_id, plan_workspace_from_registry
+from workspace_peer_model import declaration_id, plan_workspace_from_registry, prepare_workspace_from_registry
 
 
 REGISTRY = "https://registry.example.invalid"
@@ -54,6 +54,33 @@ class WorkspaceRegistryHealthTests(unittest.TestCase):
         self.assertCountEqual(self.client.fetch_npm_metadata.call_args_list, [call("demo"), call("held")])
         self.assertEqual(self.client.query_osv_versions.call_args_list,
                          [call("demo", ["1.0.0", "2.0.0"]), call("held", ["2.0.0"])])
+
+    def test_prepared_model_reuses_one_evidence_snapshot_for_distinct_assignments(self):
+        with patch("workspace_peer_model.solve_z3_exact", side_effect=AssertionError("preparation must not solve")):
+            prepared = prepare_workspace_from_registry(
+                self.packages, self.declarations, {APP: (1, 2)}, {}, self.client,
+                candidate_versions={APP: ("1.0.0", "2.0.0")},
+                health_policy=WorkspaceHealthPolicy("yellow", 0), osv_allowed_names=frozenset({"demo", "held"}),
+            )
+        metadata_count = self.client.fetch_npm_metadata.call_count
+        advisory_count = self.client.query_osv_versions.call_count
+        self.client.fetch_npm_metadata.side_effect = AssertionError("late metadata request")
+        self.client.query_osv_versions.side_effect = AssertionError("late advisory request")
+        first = prepared.solve(timeout_ms=1000)
+        second = prepared.solve((first["assignment"],), timeout_ms=1000)
+        self.assertEqual(first["status"], "SAT_IN_MODELED_DOMAIN")
+        self.assertEqual(second["status"], "SAT_IN_MODELED_DOMAIN")
+        self.assertNotEqual(first["assignment"], second["assignment"])
+        self.assertEqual(first["modelDigest"], second["modelDigest"])
+        self.assertEqual(first["policy"]["evidence"], second["policy"]["evidence"])
+        self.assertEqual(self.client.fetch_npm_metadata.call_count, metadata_count)
+        self.assertEqual(self.client.query_osv_versions.call_count, advisory_count)
+        first["domain"]["candidateCount"] = -1
+        first["policy"]["evidence"]["snapshotSha256"] = "corrupted by caller"
+        repeated = prepared.solve(timeout_ms=1000)
+        self.assertGreater(repeated["domain"]["candidateCount"], 0)
+        self.assertEqual(repeated["policy"]["evidence"], second["policy"]["evidence"])
+        self.assertEqual(repeated["assignment"], first["assignment"])
 
     def test_unapproved_osv_name_remains_unknown_and_is_not_sent(self):
         result = self.plan(frozenset({"demo"}))

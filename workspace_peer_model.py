@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from hashlib import sha256
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from typing import Mapping
 
@@ -295,7 +296,8 @@ def plan_workspace_from_lock(
     include_constraint_evidence: bool = False,
     health_solver=None,
     effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
-) -> dict:
+    prepare_only: bool = False,
+) -> dict | PreparedWorkspacePlan:
     """Plan conditionally on observed slots; an npm re-layout remains unmodeled."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
               "topology": "OBSERVED_LOCK_LAYOUT", "assignment": None}
@@ -338,10 +340,11 @@ def plan_workspace_from_lock(
     except WorkspaceModelUnknown as exc:
         return {**result, "status": "UNKNOWN", "reason": str(exc)}
 
-    return _solve_workspace_model(
-        model, result, timeout_ms, excluded_assignments,
+    prepared = PreparedWorkspacePlan(
+        model, deepcopy(result),
         _constraint_evidence(model, domains) if include_constraint_evidence else None, health_solver,
     )
+    return prepared if prepare_only else prepared.solve(excluded_assignments, timeout_ms=timeout_ms)
 
 
 def plan_workspace_in_topology(
@@ -354,7 +357,8 @@ def plan_workspace_in_topology(
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
     include_constraint_evidence: bool = False,
     health_solver=None,
-) -> dict:
+    prepare_only: bool = False,
+) -> dict | PreparedWorkspacePlan:
     """Check a proposed partition into npm instances before native resolution."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
               "topology": "PROPOSED_INSTANCE_LAYOUT", "assignment": None}
@@ -383,10 +387,11 @@ def plan_workspace_in_topology(
                     provenance="workspace-proposed-instance",
                 ))
     model = PeerOptimizationModel(model.packages, model.constraints, tuple(requirements), model.objective_width)
-    return _solve_workspace_model(
-        model, result, timeout_ms, excluded_assignments,
+    prepared = PreparedWorkspacePlan(
+        model, deepcopy(result),
         _constraint_evidence(model, domains) if include_constraint_evidence else None, health_solver,
     )
+    return prepared if prepare_only else prepared.solve(excluded_assignments, timeout_ms=timeout_ms)
 
 
 def _constraint_evidence(model, domains):
@@ -417,6 +422,40 @@ def _constraint_evidence(model, domains):
                           "allowedVersions": [], "provenance": clause.provenance})
     return {"domains": {package.name: list(package.domain) for package in model.packages if package.name in scope},
             "rules": rules, "ruleCount": total}
+
+
+@dataclass(frozen=True)
+class PreparedWorkspacePlan:
+    """Request-local static model and evidence; solving never performs I/O.
+
+    Exclusions are supplied per search, never retained or promoted to peer rules.
+    Returned dictionaries are independent of the prepared snapshot.
+    """
+
+    model: PeerOptimizationModel | None
+    result: dict
+    constraint_evidence: dict | None = None
+    health_solver: object = None
+    policy_evidence: dict | None = None
+
+    def solve(self, excluded_assignments=(), *, timeout_ms=30_000):
+        if self.model is None:
+            return deepcopy(self.result)
+        result = _solve_workspace_model(
+            self.model, deepcopy(self.result), timeout_ms, tuple(excluded_assignments),
+            deepcopy(self.constraint_evidence), self.health_solver,
+        )
+        if self.policy_evidence is not None:
+            result["policy"]["evidence"] = deepcopy(self.policy_evidence)
+        return result
+
+
+def prepare_workspace_from_registry(*args, **kwargs) -> PreparedWorkspacePlan:
+    """Collect and compile once, without solving or retaining a live client."""
+    if "prepare_only" in kwargs or kwargs.get("excluded_assignments"):
+        raise ValueError("PREPARED_WORKSPACE_EXCLUDES_SEARCH_STATE")
+    prepared = plan_workspace_from_registry(*args, **kwargs, prepare_only=True)
+    return prepared if isinstance(prepared, PreparedWorkspacePlan) else PreparedWorkspacePlan(None, deepcopy(prepared))
 
 
 def _domain_evidence(model, unknown_candidates):
@@ -486,7 +525,8 @@ def plan_workspace_from_registry(
     excluded_assignments: tuple[Mapping[str, str], ...] = (),
     include_constraint_evidence: bool = False,
     effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
-) -> dict:
+    prepare_only: bool = False,
+) -> dict | PreparedWorkspacePlan:
     """Read deduplicated packuments through the existing Core registry client."""
     from dependency_live_roadmap_generator import DraftBudgetExceeded, RegistryInfrastructureError
 
@@ -597,12 +637,15 @@ def plan_workspace_from_registry(
         packages, declarations, admitted, exact_targets, packuments,
         environment=environment, topology=topology, timeout_ms=timeout_ms,
         health_policy=health_policy, health_facts=facts, effective_peer_ranges=effective_peer_ranges,
-        candidate_evidence_errors=candidate_evidence_errors,
+        candidate_evidence_errors=candidate_evidence_errors, prepare_only=prepare_only,
         excluded_assignments=excluded_assignments, include_constraint_evidence=include_constraint_evidence,
     )
     if health_policy is not None:
-        result.setdefault("policy", unknown["policy"])
-        result["policy"]["evidence"] = evidence
+        if isinstance(result, PreparedWorkspacePlan):
+            result = replace(result, policy_evidence=deepcopy(evidence))
+        else:
+            result.setdefault("policy", unknown["policy"])
+            result["policy"]["evidence"] = evidence
     return result
 
 
@@ -622,7 +665,8 @@ def plan_workspace_upgrade(
     health_facts: Mapping[tuple[str, str], WorkspaceHealthFact] | None = None,
     candidate_evidence_errors: Mapping[tuple[Declaration, str], str] | None = None,
     effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
-) -> dict:
+    prepare_only: bool = False,
+) -> dict | PreparedWorkspacePlan:
     """Use a bounded metadata snapshot to plan under the observed npm lock layout."""
     if health_facts is not None and health_policy is None:
         raise ValueError("WORKSPACE_HEALTH_FACTS_REQUIRE_POLICY")
@@ -640,6 +684,7 @@ def plan_workspace_upgrade(
                 "reason": str(exc), "assignment": None}
     health_solver = None
     if health_policy is not None:
+        frozen_health_facts = dict(health_facts or {})
         active_names = {}
         for key in domains:
             owner, _, name = key
@@ -650,7 +695,7 @@ def plan_workspace_upgrade(
         def health_solver(model, budget):
             if not active_names:
                 return {"status": "UNKNOWN", "assignment": None, "reason": "WORKSPACE_POLICY_SCOPE_EMPTY"}
-            result = solve_workspace_health(model, active_names, health_facts or {}, health_policy, timeout_ms=budget)
+            result = solve_workspace_health(model, active_names, frozen_health_facts, health_policy, timeout_ms=budget)
             result["policy"]["internalLinkDeclarations"] = len(domains) - len(active_names)
             return result
 
@@ -659,8 +704,9 @@ def plan_workspace_upgrade(
                                           environment=environment, timeout_ms=timeout_ms,
                                           excluded_assignments=excluded_assignments,
                                           include_constraint_evidence=include_constraint_evidence,
-                                          health_solver=health_solver)
+                                          health_solver=health_solver, prepare_only=prepare_only)
     return plan_workspace_from_lock(packages, domains, environment=environment,
                                     timeout_ms=timeout_ms, excluded_assignments=excluded_assignments,
                                     include_constraint_evidence=include_constraint_evidence,
-                                    health_solver=health_solver, effective_peer_ranges=effective_peer_ranges)
+                                    health_solver=health_solver, effective_peer_ranges=effective_peer_ranges,
+                                    prepare_only=prepare_only)
