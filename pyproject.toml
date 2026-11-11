@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deploom-core"
-version = "0.1.7"
+version = "0.1.8"
 description = "Headless, planning-only dependency decision engine for DepLoom"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
