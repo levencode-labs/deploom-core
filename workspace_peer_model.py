@@ -18,7 +18,7 @@ from project_runtime import normalize_npm_range
 from peer_solver_model import PackageVariable, PeerOptimizationModel, RequiresAny, forbidden
 from peer_solver_z3 import solve_z3_exact
 from resolution_inventory import npm_lock_resolution_slots, npm_lock_resolved_instance
-from workspace_npm_lock_delta import peer_context
+from workspace_npm_lock_delta import INSTALL_SECTIONS, peer_context
 from workspace_health_policy import WorkspaceHealthFact, WorkspaceHealthPolicy, solve_workspace_health
 
 Declaration = tuple[str, str, str]
@@ -372,6 +372,52 @@ def workspace_domains_from_inputs(
     return domains
 
 
+def _project_single_nested_slot(packages, domains, keys):
+    """Project one exact owner's lookup while retaining every held lock edge."""
+    mutable = [key for key, domain in domains.items() if domain.mutable]
+    if len(mutable) != 1 or mutable[0] not in keys:
+        return None
+    target = mutable[0]
+    owner, section, name = target
+    domain = domains[target]
+    if (owner == "." or section not in INSTALL_SECTIONS or domain.exact_target in (None, domain.current)
+            or not any(row.get("link") is True and row.get("resolved") == owner for row in packages.values())):
+        return None
+    slot = f"{owner}/node_modules/{name}"
+    if any(path == slot or path.startswith(slot + "/") for path in packages):
+        return None
+
+    # This record is a lookup placeholder for a model variable. It has no
+    # package identity or peer metadata beyond the candidate's registry evidence.
+    projected = {**packages, slot: {"version": domain.current}}
+    for key in domains:
+        context = "" if key[0] == "." else key[0]
+        expected = (slot, domain.current) if key == target else npm_lock_resolved_instance(packages, key[2], context)
+        if npm_lock_resolved_instance(projected, key[2], context) != expected:
+            return None
+
+    for path, row in packages.items():
+        if not (path == owner or path.startswith(owner + "/")):
+            continue
+        for edge_section in (*INSTALL_SECTIONS, "peerDependencies"):
+            if (path, edge_section, name) == target or name not in row.get(edge_section, {}):
+                continue
+            context = peer_context(path) if edge_section == "peerDependencies" else path
+            if npm_lock_resolved_instance(projected, name, context) != npm_lock_resolved_instance(packages, name, context):
+                return None
+
+    # A held candidate can have registry peer metadata absent from its lock row.
+    for key, held in domains.items():
+        if key == target or not any(name in candidate.peers for candidate in held.candidates):
+            continue
+        instance, _ = npm_lock_resolved_instance(packages, key[2], "" if key[0] == "." else key[0])
+        entry = packages[instance]
+        context = peer_context(entry["resolved"] if entry.get("link") else instance)
+        if npm_lock_resolved_instance(projected, name, context) != npm_lock_resolved_instance(packages, name, context):
+            return None
+    return projected, slot
+
+
 def plan_workspace_from_lock(
     packages: dict,
     domains: Mapping[Declaration, WorkspaceDomain],
@@ -383,8 +429,9 @@ def plan_workspace_from_lock(
     health_solver=None,
     effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
     prepare_only: bool = False,
+    propose_nested_slot: bool = False,
 ) -> dict | PreparedWorkspacePlan:
-    """Plan conditionally on observed slots; an npm re-layout remains unmodeled."""
+    """Plan under observed slots or one guarded, hypothetical nested slot."""
     result = {"authority": "PLANNING_ONLY", "verification": "NOT_VERIFIED",
               "topology": "OBSERVED_LOCK_LAYOUT", "assignment": None}
     try:
@@ -425,6 +472,22 @@ def plan_workspace_from_lock(
             if len(keys) > 1:
                 candidate_sets = {variables[declaration_id(key)].domain for key in keys}
                 if len(candidate_sets) != 1 or len(next(iter(candidate_sets))) != 1:
+                    if propose_nested_slot and not effective_peer_ranges and health_solver is None:
+                        projection = _project_single_nested_slot(packages, domains, keys)
+                        if projection is not None:
+                            projected, slot = projection
+                            prepared = plan_workspace_from_lock(
+                                projected, domains, environment=environment, prepare_only=True,
+                                include_constraint_evidence=include_constraint_evidence,
+                            )
+                            if (isinstance(prepared, PreparedWorkspacePlan)
+                                    and prepared.result["domain"]["evidenceCoverage"] == "COMPLETE"):
+                                prepared = replace(prepared, result={
+                                    **prepared.result, "topology": "PROPOSED_INSTANCE_LAYOUT",
+                                    "proposedNestedSlot": slot,
+                                })
+                                return prepared if prepare_only else prepared.solve(
+                                    excluded_assignments, timeout_ms=timeout_ms)
                     raise WorkspaceModelUnknown(f"SHARED_SLOT_RELAYOUT_UNMODELED: {path}")
     except WorkspaceModelUnknown as exc:
         return {**result, "status": "UNKNOWN", "reason": str(exc)}
@@ -534,6 +597,8 @@ class PreparedWorkspacePlan:
             self.model, deepcopy(self.result), timeout_ms, tuple(excluded_assignments),
             deepcopy(self.constraint_evidence), self.health_solver,
         )
+        if "proposedNestedSlot" in result and result["status"] == "UNSAT_IN_MODELED_DOMAIN":
+            result.update(status="UNKNOWN", reason="PROPOSED_NESTED_SLOT_HAS_NO_WITNESS", optimality="NOT_PROVEN")
         if self.policy_evidence is not None:
             result["policy"]["evidence"] = deepcopy(self.policy_evidence)
         return result
@@ -575,7 +640,8 @@ def _finish_workspace_solution(result, *, health_evidence=False):
 
 def _solve_workspace_model(model, result, timeout_ms, excluded_assignments, constraint_evidence, health_solver):
     result["modelDigest"] = sha256(json.dumps(
-        {"model": asdict(model), "topology": result["topology"]},
+        {"model": asdict(model), "topology": result["topology"],
+         **({"proposedNestedSlot": result["proposedNestedSlot"]} if "proposedNestedSlot" in result else {})},
         sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
     if constraint_evidence is not None:
         result["constraintEvidence"] = constraint_evidence
@@ -617,6 +683,7 @@ def plan_workspace_from_registry(
     include_constraint_evidence: bool = False,
     effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
     prepare_only: bool = False,
+    propose_nested_slot: bool = False,
 ) -> dict | PreparedWorkspacePlan:
     """Read deduplicated packuments through the existing Core registry client."""
     from dependency_live_roadmap_generator import DraftBudgetExceeded, RegistryInfrastructureError
@@ -752,6 +819,7 @@ def plan_workspace_from_registry(
         health_policy=health_policy, health_facts=facts, effective_peer_ranges=effective_peer_ranges,
         candidate_evidence_errors=candidate_evidence_errors, prepare_only=prepare_only,
         excluded_assignments=excluded_assignments, include_constraint_evidence=include_constraint_evidence,
+        propose_nested_slot=propose_nested_slot,
     )
     if bounded_selection:
         selected = [{"declaration": list(key), "versions": list(versions)} for key, versions in sorted(admitted.items())]
@@ -793,8 +861,9 @@ def plan_workspace_upgrade(
     candidate_evidence_errors: Mapping[tuple[Declaration, str], str] | None = None,
     effective_peer_ranges: Mapping[tuple[str, str, str, str], str] | None = None,
     prepare_only: bool = False,
+    propose_nested_slot: bool = False,
 ) -> dict | PreparedWorkspacePlan:
-    """Use a bounded metadata snapshot to plan under the observed npm lock layout."""
+    """Use a bounded metadata snapshot to plan under an npm lock layout."""
     if health_facts is not None and health_policy is None:
         raise ValueError("WORKSPACE_HEALTH_FACTS_REQUIRE_POLICY")
     try:
@@ -838,4 +907,4 @@ def plan_workspace_upgrade(
                                     timeout_ms=timeout_ms, excluded_assignments=excluded_assignments,
                                     include_constraint_evidence=include_constraint_evidence,
                                     health_solver=health_solver, effective_peer_ranges=effective_peer_ranges,
-                                    prepare_only=prepare_only)
+                                    prepare_only=prepare_only, propose_nested_slot=propose_nested_slot)

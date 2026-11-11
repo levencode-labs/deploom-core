@@ -67,6 +67,46 @@ class PartialDomainTests(unittest.TestCase):
         self.assertEqual(result["status"], "UNKNOWN")
         self.assertIn("SHARED_SLOT_RELAYOUT_UNMODELED", result["reason"])
 
+    def test_exact_workspace_target_can_model_one_nested_slot(self):
+        app = "packages/app"
+        target = (app, "dependencies", "plugin")
+        packages = {
+            **self.packages,
+            "node_modules/app": {"link": True, "resolved": app},
+            app: {"version": "1.0.0", "dependencies": {"plugin": "^1"}},
+            "node_modules/engine": {"version": "1.0.0"},
+        }
+        candidate = WorkspaceCandidate("2.0.0", {"engine": "^1"})
+        domains = {
+            target: WorkspaceDomain("1.0.0", (candidate,), mutable=True, exact_target="2.0.0"),
+            self.key: WorkspaceDomain("1.0.0", (self.known,)),
+            self.provider: WorkspaceDomain("1.0.0", (self.known,)),
+        }
+        observed = plan_workspace_from_lock(packages, domains)
+        self.assertEqual(observed["status"], "UNKNOWN")
+        plan = plan_workspace_from_lock(packages, domains, propose_nested_slot=True)
+        self.assertEqual(plan["status"], "SAT_IN_MODELED_DOMAIN")
+        self.assertEqual(plan["topology"], "PROPOSED_INSTANCE_LAYOUT")
+        self.assertEqual(plan["proposedNestedSlot"], f"{app}/node_modules/plugin")
+        self.assertEqual(plan["assignment"][declaration_id(target)], "2.0.0")
+        self.assertEqual(plan["assignment"][declaration_id(self.key)], "1.0.0")
+        self.assertEqual(plan["verification"], "NOT_VERIFIED")
+        self.assertNotIn(plan["proposedNestedSlot"], packages)
+
+        for replacement in (replace(candidate, peers={"engine": "^2"}),
+                            replace(candidate, evidence_reason="registry metadata unavailable")):
+            with self.subTest(replacement=replacement):
+                blocked = {**domains, target: replace(domains[target], candidates=(replacement,))}
+                result = plan_workspace_from_lock(packages, blocked, propose_nested_slot=True)
+                self.assertEqual(result["status"], "UNKNOWN")
+                self.assertIsNone(result["assignment"])
+
+        held_consumer = f"{app}/node_modules/held-consumer"
+        packages[held_consumer] = {"version": "1.0.0", "peerDependencies": {"plugin": "^1"}}
+        result = plan_workspace_from_lock(packages, domains, propose_nested_slot=True)
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertIsNone(result["assignment"])
+
     def test_optional_absence_and_incompatible_presence_remain_distinct(self):
         candidate = WorkspaceCandidate("1.0.0", {"engine": "^2"}, frozenset({"engine"}))
         domains = {self.key: WorkspaceDomain("1.0.0", (candidate,)),
