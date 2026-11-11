@@ -114,6 +114,87 @@ def workspace_providers_from_lock(
     return bindings
 
 
+def _workspace_owner_peer_rows(packages):
+    """Read root and linked-owner contracts from the supplied lock snapshot.
+
+    MCP binds these records to current manifest bytes before calling Core.
+    Direct Core callers receive a verdict conditional on their lock evidence.
+    Peers shadowed by installed edges follow the native npm preflight semantics.
+    """
+    links = {row["resolved"] for row in packages.values()
+             if isinstance(row, dict) and row.get("link") is True
+             and isinstance(row.get("resolved"), str)}
+    rows = []
+    for owner, record in sorted(packages.items()):
+        if "node_modules" in owner.split("/"):
+            continue
+        if not isinstance(record, dict):
+            raise WorkspaceModelUnknown(f"OWNER_MANIFEST_UNPROVEN: {owner}")
+        peers = record.get("peerDependencies", {})
+        meta = record.get("peerDependenciesMeta", {})
+        if (not isinstance(peers, dict) or not isinstance(meta, dict)
+                or any(not isinstance(record.get(section, {}), dict)
+                       for section in ("dependencies", "optionalDependencies"))):
+            raise WorkspaceModelUnknown(f"OWNER_PEER_METADATA_UNSUPPORTED: {owner}")
+        if peers and owner and owner not in links:
+            raise WorkspaceModelUnknown(f"OWNER_LINK_UNPROVEN: {owner}")
+        for peer, spec in sorted(peers.items()):
+            if (not isinstance(peer, str) or not isinstance(spec, str)
+                    or not isinstance(meta.get(peer, {}), dict)):
+                raise WorkspaceModelUnknown(f"OWNER_PEER_METADATA_UNSUPPORTED: {owner}")
+            if any(peer in record.get(section, {}) for section in ("dependencies", "optionalDependencies")):
+                continue
+            rows.append((owner, peer, spec, meta.get(peer, {}).get("optional") is True))
+    return rows
+
+
+def _constrain_workspace_owner_peers(model, packages, domains, effective_peer_ranges):
+    """Constrain provider variables without inventing owner install declarations."""
+    rows = _workspace_owner_peer_rows(packages)
+    by_slot = {}
+    for key, domain in domains.items():
+        slot = npm_lock_resolved_instance(packages, key[2], "" if key[0] == "." else key[0])
+        if slot is not None and slot[1] == domain.current:
+            by_slot.setdefault(slot[0], []).append(key)
+    variables = model.package_map()
+    constraints = list(model.constraints)
+    for owner, peer, raw, optional in rows:
+        spec = (effective_peer_ranges or {}).get((owner, packages[owner].get("version"), peer, raw), raw)
+        try:
+            matcher = NpmSpec(normalize_npm_range(spec))
+        except (ValueError, TypeError) as exc:
+            raise WorkspaceModelUnknown(f"OWNER_PEER_RANGE_UNSUPPORTED: {owner} -> {peer}: {spec}") from exc
+        resolved = npm_lock_resolved_instance(packages, peer, owner)
+        if resolved is None:
+            if optional and not any(slot in packages for slot in npm_lock_resolution_slots(peer, owner)):
+                continue
+            raise WorkspaceModelUnknown(f"OWNER_PEER_PROVIDER_UNPROVEN: {owner} -> {peer}")
+        slot, current = resolved
+        keys = by_slot.get(slot, ())
+        reason = f"workspace owner {owner or '.'} requires {peer}@{spec}"
+        if keys:
+            for key in keys:
+                variable = variables[declaration_id(key)]
+                for version in variable.domain:
+                    if not matcher.match(Version(version)):
+                        constraints.append(forbidden(((variable.name, version),), reason=reason,
+                                                     provenance="workspace-owner-peer"))
+        else:
+            record = packages[slot]
+            if (record.get("link") or record.get("name", peer) != peer
+                    or not isinstance(record.get("resolved"), str)
+                    or not record["resolved"].startswith("https://")
+                    or not isinstance(record.get("integrity"), str) or not record["integrity"]):
+                raise WorkspaceModelUnknown(f"OWNER_PEER_PROVIDER_UNPROVEN: {owner} -> {peer}")
+            if not matcher.match(Version(current)):
+                # An immutable external provider violates the owner contract for
+                # every assignment; block each literal of an existing variable.
+                variable = model.packages[0]
+                constraints.extend(forbidden(((variable.name, version),), reason=reason,
+                                             provenance="workspace-owner-peer") for version in variable.domain)
+    return replace(model, constraints=tuple(constraints)), len(rows)
+
+
 def compile_workspace_peer_model(
     domains: Mapping[Declaration, WorkspaceDomain],
     providers: Mapping[tuple[Declaration, str], Declaration | LockedWorkspacePeer | None],
@@ -330,6 +411,9 @@ def plan_workspace_from_lock(
         model = compile_workspace_peer_model(
             domains, workspace_providers_from_lock(packages, domains), environment=environment,
             unknown_candidates=unknown_candidates)
+        model, owner_peer_count = _constrain_workspace_owner_peers(
+            model, packages, domains, effective_peer_ranges)
+        result["ownerPeerConstraintCount"] = owner_peer_count
         result["domain"] = _domain_evidence(model, unknown_candidates)
         variables = model.package_map()
         for path, keys in instances.items():
@@ -411,7 +495,7 @@ def _constraint_evidence(model, domains):
                 "provenance": requirement.provenance,
             })
     for clause in model.constraints:
-        if clause.provenance not in {"workspace-modeled-engine-range", "workspace-observed-transitive-peer"}:
+        if clause.provenance not in {"workspace-modeled-engine-range", "workspace-observed-transitive-peer", "workspace-owner-peer"}:
             continue
         consumer, version = clause.literals[0]
         if consumer not in scope:
@@ -709,6 +793,8 @@ def plan_workspace_upgrade(
     if health_facts is not None and health_policy is None:
         raise ValueError("WORKSPACE_HEALTH_FACTS_REQUIRE_POLICY")
     try:
+        if topology is not None and _workspace_owner_peer_rows(packages):
+            raise WorkspaceModelUnknown("PROPOSED_LAYOUT_OWNER_PEERS_UNPROVEN")
         domains = workspace_domains_from_inputs(
             packages, declarations, admitted_versions, exact_targets, packuments, allow_partial=True)
         for key, domain in list(domains.items()):
