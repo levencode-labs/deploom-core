@@ -164,12 +164,17 @@ def _constrain_workspace_owner_peers(model, packages, domains, effective_peer_ra
             matcher = NpmSpec(normalize_npm_range(spec))
         except (ValueError, TypeError) as exc:
             raise WorkspaceModelUnknown(f"OWNER_PEER_RANGE_UNSUPPORTED: {owner} -> {peer}: {spec}") from exc
+        nearest = next((slot for slot in npm_lock_resolution_slots(peer, owner) if slot in packages), None)
         resolved = npm_lock_resolved_instance(packages, peer, owner)
-        if resolved is None:
-            if optional and not any(slot in packages for slot in npm_lock_resolution_slots(peer, owner)):
+        if resolved is None or resolved[0] != nearest:
+            if optional and nearest is None:
                 continue
             raise WorkspaceModelUnknown(f"OWNER_PEER_PROVIDER_UNPROVEN: {owner} -> {peer}")
         slot, current = resolved
+        try:
+            current_version = Version(current)
+        except (ValueError, TypeError) as exc:
+            raise WorkspaceModelUnknown(f"OWNER_PEER_PROVIDER_UNPROVEN: {owner} -> {peer}") from exc
         keys = by_slot.get(slot, ())
         reason = f"workspace owner {owner or '.'} requires {peer}@{spec}"
         if keys:
@@ -186,7 +191,7 @@ def _constrain_workspace_owner_peers(model, packages, domains, effective_peer_ra
                     or not record["resolved"].startswith("https://")
                     or not isinstance(record.get("integrity"), str) or not record["integrity"]):
                 raise WorkspaceModelUnknown(f"OWNER_PEER_PROVIDER_UNPROVEN: {owner} -> {peer}")
-            if not matcher.match(Version(current)):
+            if not matcher.match(current_version):
                 # An immutable external provider violates the owner contract for
                 # every assignment; block each literal of an existing variable.
                 variable = model.packages[0]

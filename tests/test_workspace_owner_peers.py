@@ -39,6 +39,25 @@ class WorkspaceOwnerPeerTests(unittest.TestCase):
         self.packages["node_modules/absent"] = {}
         self.assertEqual(self.plan()["status"], "UNKNOWN")
 
+    def test_malformed_nearest_slot_cannot_fall_back_to_compatible_ancestor(self):
+        for optional in (False, True):
+            self.packages["packages/keeper"]["peerDependenciesMeta"] = {"provider": {"optional": optional}}
+            for malformed in ({}, None, {"version": ""}):
+                with self.subTest(optional=optional, malformed=malformed):
+                    self.packages["packages/keeper/node_modules/provider"] = malformed
+                    result = self.plan()
+                    self.assertEqual(result["status"], "UNKNOWN")
+                    self.assertIsNone(result["assignment"])
+                    self.assertIn("OWNER_PEER_PROVIDER_UNPROVEN", result["reason"])
+
+    def test_invalid_fixed_provider_version_is_unknown(self):
+        self.packages["packages/keeper/node_modules/provider"] = {"version": "bad",
+            "resolved": "https://registry.example/provider.tgz", "integrity": "sha512-fixture"}
+        result = self.plan()
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertIsNone(result["assignment"])
+        self.assertIn("OWNER_PEER_PROVIDER_UNPROVEN", result["reason"])
+
     def test_required_missing_peer_and_unlinked_owner_are_unknown(self):
         self.packages["packages/keeper"]["peerDependencies"] = {"absent": "^2"}
         self.assertEqual(self.plan()["status"], "UNKNOWN")
