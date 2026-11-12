@@ -25,6 +25,13 @@ class NpmLockOnlyPreparationTests(unittest.TestCase):
         for filename, value in (("package.json", manifest), ("package-lock.json", lock)):
             (self.project / filename).write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
         (self.project / "verify.cjs").write_text("require('./package.json');\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        subprocess.run(["git", "add", "--", "."], cwd=self.project, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=DepLoom Test", "-c", "user.email=deploom@example.invalid",
+             "commit", "-q", "-m", "Create verification fixture"],
+            cwd=self.project, check=True,
+        )
         self.config = verifier.BaselineVerifyConfig(
             commands=("node verify.cjs",), project_checks="strict", lifecycle_scripts=False,
             timeout_seconds=30, attempt_timeout_seconds=60,
