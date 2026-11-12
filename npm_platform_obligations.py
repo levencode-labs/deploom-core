@@ -1,5 +1,5 @@
 ﻿"""Explicit npm-v3 platform absence: archive-bound evidence, never npm-exit inference."""
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import base64,hashlib,json,re,os,shutil,tarfile,io
 from semantic_version import NpmSpec,Version
 from project_runtime import normalize_npm_range
@@ -52,19 +52,23 @@ def validate_rules_shape(rules):
   seen.add(row['instance'])
  return rules
 
+def _file_sha256(path):
+ with path.open('rb') as stream:
+  return hashlib.file_digest(stream,'sha256').hexdigest()
+
 def observe_node_host():
  from verification_process_supervisor import run_supervised
  if os.environ.get('NODE_OPTIONS') or os.environ.get('NODE_PATH'):_fail('EXTERNAL_NODE_LOADER')
  node=shutil.which('node')
  if not node:_fail('NODE_MISSING')
- path=Path(node).resolve();before=path.read_bytes()
+ path=Path(node).resolve();before=_file_sha256(path)
  result=run_supervised([str(path),'-p','JSON.stringify({platform:process.platform,arch:process.arch})'],Path.cwd(),timeout_seconds=10,max_output_bytes=4096)
  supervision=getattr(result,'supervision',None)
  if (result.returncode or getattr(supervision,'quality',None)!='guaranteed-tree'
-   or getattr(supervision,'descendants_remaining',None)!=0 or path.read_bytes()!=before):_fail('HOST_UNPROVEN')
+   or getattr(supervision,'descendants_remaining',None)!=0 or _file_sha256(path)!=before):_fail('HOST_UNPROVEN')
  value=_object(result.stdout.encode())
  if set(value)!={'platform','arch'}:_fail('HOST_UNPROVEN')
- return {**value,'nodeSha256':_sha(before)}
+ return {**value,'nodeSha256':before}
 
 def _selectors(raw,actual):
  if raw is None:return True
@@ -93,13 +97,18 @@ def _archive(path,row,canonical):
  if not path.is_file() or path.stat().st_size>32*1024*1024:_fail('ARCHIVE_SIZE')
  raw=path.read_bytes();sri='sha512-'+base64.b64encode(hashlib.sha512(raw).digest()).decode()
  if row.get('integrity')!=sri:_fail('ARTIFACT_SRI_MISMATCH')
- manifest=None;total=0;count=0
+ manifest=None;total=0;count=0;root=None
  try:
   with tarfile.open(fileobj=io.BytesIO(raw),mode='r|gz') as archive:
    for member in archive:
     total+=member.size;count+=1
     if total>128*1024*1024 or count>10000:_fail('ARCHIVE_EXPANSION_LIMIT')
-    if member.name=='package/package.json':
+    parts=PurePosixPath(member.name).parts
+    if (not parts or member.name.startswith('/') or '..' in parts
+        or any(':' in part or chr(92) in part for part in parts)):_fail('ARCHIVE_ENTRY_PATH')
+    if root is None:root=parts[0]
+    if parts[0]!=root:_fail('ARCHIVE_ROOT_UNPROVEN')
+    if len(parts)==2 and parts[1]=='package.json':
      if manifest is not None or not member.isfile() or member.size>1024*1024:_fail('MANIFEST_UNPROVEN')
      manifest=_object(archive.extractfile(member).read(1024*1024+1))
  except (tarfile.TarError,OSError) as exc:raise NpmPlatformEvidenceError('NPM_PLATFORM_ARCHIVE_UNPROVEN') from exc
@@ -180,6 +189,19 @@ def v2_alias_bindings(lock):
  return aliases
 
 
+def _index_omission_edges(graph, locations):
+ incoming={location:[] for location in locations}
+ for owner,parent in graph.items():
+  for section in ('dependencies','devDependencies','optionalDependencies','peerDependencies'):
+   declarations=parent.get(section,{})
+   if not isinstance(declarations,dict):_fail('EDGE_UNPROVEN')
+   for name,spec in declarations.items():
+    if section=='dependencies' and name in parent.get('optionalDependencies',{}):continue
+    location=_resolve(graph,owner,name,section=='peerDependencies')
+    if location in incoming:
+     incoming[location].append((owner,parent,section,name,spec))
+ return incoming
+
 def verify_platform_absence(lock,rules):
  validate_rules_shape(rules)
  version=lock.get('lockfileVersion')
@@ -191,6 +213,7 @@ def verify_platform_absence(lock,rules):
  graph=lock.get('packages');proof={};total=0
  if (not isinstance(graph,dict) or '' not in graph or len(graph)>10001
    or any(not isinstance(v,dict) for v in graph.values())):_fail('GRAPH_UNPROVEN')
+ incoming_by_location=None
  for evidence in rules['artifacts']:
   location=evidence['instance'];row=graph.get(location)
   if (not isinstance(row,dict) or row.get('optional') is not True
@@ -209,26 +232,22 @@ def verify_platform_absence(lock,rules):
   if os_ok and cpu_ok:_fail('HOST_APPLICABLE')
   # libc is not applicable on supported Windows hosts. A Unix host is not
   # admitted by the explicit host schema; no guessed libc evaluation occurs.
+  if incoming_by_location is None:
+   incoming_by_location=_index_omission_edges(graph,{item['instance'] for item in rules['artifacts']})
   incoming=[]
-  for owner,parent in graph.items():
-   for section in ('dependencies','devDependencies','optionalDependencies','peerDependencies'):
-    declarations=parent.get(section,{})
-    if not isinstance(declarations,dict):_fail('EDGE_UNPROVEN')
-    for name,spec in declarations.items():
-     if section=='dependencies' and name in parent.get('optionalDependencies',{}):continue
-     if _resolve(graph,owner,name,section=='peerDependencies')!=location:continue
-     if section!='optionalDependencies' or not isinstance(spec,str):_fail('REQUIRED_INCOMING_EDGE')
-     wanted=canonical;requirement=spec
-     if spec.startswith('npm:'):
-      prefix='npm:'+canonical+'@'
-      if not spec.startswith(prefix):_fail('ALIAS_UNPROVEN')
-      requirement=spec[len(prefix):]
-     elif name!=canonical:_fail('EDGE_IDENTITY')
-     try:valid=NpmSpec(normalize_npm_range(requirement)).match(Version(row['version']))
-     except (ValueError,KeyError,TypeError) as exc:raise NpmPlatformEvidenceError('NPM_PLATFORM_EDGE_RANGE_UNPROVEN') from exc
-     if not valid:_fail('EDGE_RANGE_MISMATCH')
-     if version==2 and owner:_v2_view_record(lock,owner,parent)
-     incoming.append({'owner':owner,'section':section,'name':name,'specifier':spec,'target':location})
+  for owner,parent,section,name,spec in incoming_by_location[location]:
+   if section!='optionalDependencies' or not isinstance(spec,str):_fail('REQUIRED_INCOMING_EDGE')
+   requirement=spec
+   if spec.startswith('npm:'):
+    prefix='npm:'+canonical+'@'
+    if not spec.startswith(prefix):_fail('ALIAS_UNPROVEN')
+    requirement=spec[len(prefix):]
+   elif name!=canonical:_fail('EDGE_IDENTITY')
+   try:valid=NpmSpec(normalize_npm_range(requirement)).match(Version(row['version']))
+   except (ValueError,KeyError,TypeError) as exc:raise NpmPlatformEvidenceError('NPM_PLATFORM_EDGE_RANGE_UNPROVEN') from exc
+   if not valid:_fail('EDGE_RANGE_MISMATCH')
+   if version==2 and owner:_v2_view_record(lock,owner,parent)
+   incoming.append({'owner':owner,'section':section,'name':name,'specifier':spec,'target':location})
   if not incoming:_fail('ORPHAN_OMISSION')
   proof[location]={'path':location,'installName':install_name,'canonicalName':canonical,'version':row['version'],
     'resolved':resolved,'outcome':'VERIFIED_PLATFORM_INAPPLICABLE','host':host,

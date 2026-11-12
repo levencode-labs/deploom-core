@@ -9,6 +9,44 @@ from workspace_registry_metadata import fetch_workspace_packuments
 
 
 class MetadataHTTPTests(unittest.TestCase):
+    def test_keeps_four_http_connections_for_multiple_stateless_windows(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                name = self.path.strip("/")
+                requests.append((name, self.client_address[1]))
+                body = json.dumps({"name": name, "versions": {
+                    "1.0.0": {"name": name, "version": "1.0.0"},
+                }}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = LiveDataClient(f"http://127.0.0.1:{server.server_port}",
+            timeout=1, batch_size=8, sleep_sec=0, allow_registry_metadata_redirects=False)
+        client.set_deadline(DeadlineClock(10))
+        try:
+            names = [f"p{i}" for i in range(24)]
+            result = fetch_workspace_packuments(client, names)
+            self.assertEqual(list(result), names)
+            self.assertCountEqual([name for name, _ in requests], names)
+            self.assertEqual(len({port for _, port in requests}), 4)
+        finally:
+            client.session.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+
     def test_cookie_and_no_store_replay_match_sequential_across_five_names(self):
         for stateful in ('cookie', 'no-store'):
             with self.subTest(stateful=stateful):

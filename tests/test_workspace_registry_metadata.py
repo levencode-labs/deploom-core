@@ -41,7 +41,7 @@ class WorkspaceMetadataTests(unittest.TestCase):
             result = fetch_workspace_packuments(client, ['p'+str(i) for i in range(8)] + ['p0'])
         self.assertEqual(list(result), ['p'+str(i) for i in range(8)])
         self.assertEqual(peak, 4)
-        self.assertEqual(len(workers), 8)
+        self.assertEqual(len(workers), 4)
         self.assertEqual(client.npm_cache, {})
         for worker in workers:
             worker.session.close.assert_called_once()

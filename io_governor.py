@@ -12,8 +12,13 @@ from typing import Iterator
 from verification_observability import emit_observability_event, new_observability_id
 
 
+# Match the existing Windows source-hash worker budget. A smaller pool
+# serializes file opens on large copies while the remaining workers wait.
+_DEFAULT_HASH_SLOTS = max(2, min(8, (os.cpu_count() or 4) // 2)) if os.name == "nt" else 2
+
+
 def _configured_slots(kind: str) -> int:
-    defaults = {"copy": 2 if os.name == "nt" else 2, "hash": 2, "pm": 1}
+    defaults = {"copy": 2, "hash": _DEFAULT_HASH_SLOTS, "pm": 1}
     raw = str(os.environ.get(f"DEPLOOM_IO_{kind.upper()}_SLOTS") or "").strip()
     if raw:
         try:

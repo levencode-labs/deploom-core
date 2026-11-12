@@ -54,11 +54,15 @@ class WorkspaceChangeGuard:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self._watcher: Optional["_DirectoryWatcher"] = None
+        self._root_identity: Optional[tuple[int, int]] = None
         self._started = False
         self._stopped: Optional[WorkspaceChangeResult] = None
 
     def start(self) -> bool:
         if os.name != "nt":
+            return False
+        self._root_identity = tree_object_identity(self.root)
+        if self._root_identity is None:
             return False
         watcher = _DirectoryWatcher(self.root)
         self._watcher = watcher
@@ -77,13 +81,20 @@ class WorkspaceChangeGuard:
             # Drain notifications before cancellation; quiescent process trees
             # alone do not prove that queued filesystem events were delivered.
             from source_snapshot import _drain_watcher
+            drained = False
             try:
-                if not _drain_watcher(watcher, self.root, barrier_paths=barrier_paths):
-                    watcher.errors.append("private trial event barrier unavailable")
+                if tree_object_identity(self.root) != self._root_identity:
+                    watcher.errors.append("private trial root identity changed")
+                else:
+                    drained = _drain_watcher(watcher, self.root, barrier_paths=barrier_paths)
+                    if not drained:
+                        watcher.errors.append("private trial event barrier unavailable")
+                    if tree_object_identity(self.root) != self._root_identity:
+                        watcher.errors.append("private trial root identity changed")
             except Exception as exc:
                 watcher.errors.append(f"private trial event barrier failed: {exc}")
             finally:
-                watcher.stop()
+                watcher.stop(drained=drained)
         changes = tuple(sorted({
             f"{action}:{name.replace(chr(92), '/')}"
             for action, name in watcher.events
@@ -589,7 +600,7 @@ def _run_overlay_robocopy(
         argv.extend(["/XD", *[str(path) for path in excluded]])
     if progress:
         progress(
-            "Ω guarded lower: copying sealed source/config/.git upper "
+            "Guarded lower: copying sealed source/config/.git upper "
             "without dependency payload bytes"
         )
     try:
@@ -644,45 +655,14 @@ def _remove_junction(path: Path) -> None:
             pass
 
 
-def _batch_escape(value: Path) -> str:
-    return str(value).replace("%", "%%").replace('"', '""')
-
-
 def _create_junction_batch(pairs: list[tuple[Path, Path]]) -> bool:
-    if not pairs:
-        return True
-    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
-    if not comspec:
-        return False
-    batch = pairs[0][0].parent / f".deploom-junctions-{os.getpid()}-{threading.get_ident()}.cmd"
-    lines = ["@echo off"]
-    for link, target in pairs:
-        link.parent.mkdir(parents=True, exist_ok=True)
-        lines.append(
-            f'mklink /J "{_batch_escape(link)}" "{_batch_escape(target)}" >nul || exit /b 1'
-        )
-    lines.append("exit /b 0")
     try:
-        batch.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
-        command = subprocess.list2cmdline([str(batch)])
-        result = subprocess.run(
-            [comspec, "/d", "/s", "/c", command],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=max(30, min(180, len(pairs))),
-            check=False,
-        )
-        return result.returncode == 0 and all(link.is_dir() for link, _ in pairs)
-    except (OSError, subprocess.SubprocessError):
+        for link, target in pairs:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            _create_checked_junction(link, target)
+    except (OSError, ValueError, ReparseMaterializationError, subprocess.SubprocessError):
         return False
-    finally:
-        try:
-            batch.unlink()
-        except OSError:
-            pass
+    return True
 
 
 def _copy_local_bin(source: Path, target: Path) -> bool:
@@ -782,6 +762,18 @@ def _populate_node_modules_shell(
                     add_entry(child, destination / child.name, scope_level=True)
                     for child in children
                 )
+            # Launching esbuild.exe can generate a change notification even
+            # when its contents are stable. Keep both the Windows binary and
+            # its JS loader private so Node resolves the executable in the clone.
+            private_esbuild = (
+                (not scope_level and lowered == "esbuild")
+                or (scope_level and entry.parent.name.lower() == "@esbuild" and lowered.startswith("win32-"))
+            )
+            if private_esbuild:
+                relative = entry.relative_to(prepared_workspace_root)
+                if not any(relative in Path(item.link_relative).parents for item in reparse_plan):
+                    shutil.copytree(entry, destination, symlinks=True)
+                    return True
             pairs.append((destination, entry.resolve()))
             return True
         if entry.is_file():
@@ -843,10 +835,13 @@ def apply_tree_write_protection(
         for name in names:
             path = Path(current) / name
             try:
-                mode = os.stat(path, follow_symlinks=False).st_mode
+                info = os.stat(path, follow_symlinks=False)
+                if (not stat.S_ISREG(info.st_mode)
+                        or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                    continue
                 os.chmod(
                     path,
-                    (mode & ~0o222) if readonly else (mode | stat.S_IWRITE),
+                    (info.st_mode & ~0o222) if readonly else (info.st_mode | stat.S_IWRITE),
                 )
                 touched += 1
             except OSError:
@@ -902,6 +897,7 @@ def drain_watcher(
     """
     token = f".deploom-drain-{uuid.uuid4().hex}"
     marker = root / token
+    cursor = len(watcher.events)
     try:
         marker.write_text("drain", encoding="utf-8")
     except OSError:
@@ -910,7 +906,9 @@ def drain_watcher(
     delivered = False
     try:
         while time.monotonic() < deadline:
-            if any(token in relative for _action, relative in list(watcher.events)):
+            arrived = watcher.events[cursor:]
+            cursor += len(arrived)
+            if any(relative == token for _action, relative in arrived):
                 delivered = True
                 break
             if watcher.errors:
@@ -945,6 +943,10 @@ class _DirectoryWatcher:
     FILTER = 0x00000001 | 0x00000002 | 0x00000004 | 0x00000008 | 0x00000010 | 0x00000040
     ERROR_IO_PENDING = 997
     ERROR_OPERATION_ABORTED = 995
+    ERROR_NOT_FOUND = 1168
+    DRIVE_FIXED = 3
+    DEFAULT_BUFFER_BYTES = 64 * 1024
+    LOCAL_BURST_BUFFER_BYTES = 1024 * 1024
 
     class _OVERLAPPED(ctypes.Structure):
         _fields_ = [
@@ -953,15 +955,17 @@ class _DirectoryWatcher:
             ("hEvent", ctypes.c_void_p),
         ]
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, reserve_write_bursts: bool = False) -> None:
         self.root = root.resolve()
+        self._reserve_write_bursts = reserve_write_bursts
         self.events: list[tuple[int, str]] = []
         self.errors: list[str] = []
         self._stop = threading.Event()
+        self._io_lock = threading.Lock()
         self._handle = None
         self._event_handle = None
         self._overlapped: Optional[_DirectoryWatcher._OVERLAPPED] = None
-        self._buffer = ctypes.create_string_buffer(64 * 1024)
+        self._buffer = ctypes.create_string_buffer(self.DEFAULT_BUFFER_BYTES)
         self._thread: Optional[threading.Thread] = None
         self.armed_ms = 0
 
@@ -974,6 +978,12 @@ class _DirectoryWatcher:
             wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID, wintypes.LPVOID,
         ]
         kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
+        kernel32.ResetEvent.argtypes = [wintypes.HANDLE]
+        kernel32.ResetEvent.restype = wintypes.BOOL
+        kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(_DirectoryWatcher._OVERLAPPED)]
+        kernel32.CancelIoEx.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
         return kernel32
 
     def _issue(self) -> bool:
@@ -998,6 +1008,12 @@ class _DirectoryWatcher:
         from ctypes import wintypes
         started = time.monotonic()
         kernel32 = self._kernel32()
+        if self._reserve_write_bursts and self.root.anchor:
+            # ReadDirectoryChangesW has a 64 KiB limit on network shares.
+            kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+            kernel32.GetDriveTypeW.restype = wintypes.UINT
+            if kernel32.GetDriveTypeW(self.root.anchor) == self.DRIVE_FIXED:
+                self._buffer = ctypes.create_string_buffer(self.LOCAL_BURST_BUFFER_BYTES)
         kernel32.CreateFileW.argtypes = [
             wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
             wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
@@ -1034,7 +1050,7 @@ class _DirectoryWatcher:
         self.armed_ms = max(0, int((time.monotonic() - started) * 1000))
         emit_observability_event(
             "filesystem.watcher.armed", root=str(self.root), armedMs=self.armed_ms,
-            backend="ReadDirectoryChangesW-overlapped", outcome="passed",
+            backend="ReadDirectoryChangesW-overlapped", outcome="passed", bufferBytes=len(self._buffer),
         )
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -1044,7 +1060,7 @@ class _DirectoryWatcher:
         if size == 0:
             self.errors.append(f"ReadDirectoryChangesW buffer overflow for {self.root}")
             return
-        raw = self._buffer.raw
+        raw = self._buffer[:size]
         offset = 0
         while offset + 12 <= size:
             next_offset = int.from_bytes(raw[offset:offset + 4], "little")
@@ -1068,7 +1084,9 @@ class _DirectoryWatcher:
         kernel32.GetOverlappedResult.restype = wintypes.BOOL
         returned = wintypes.DWORD(0)
         try:
-            while not self._stop.is_set():
+            # A pending operation owns the buffer until completion, even
+            # when stop() requested cancellation before this thread ran.
+            while True:
                 ok = kernel32.GetOverlappedResult(
                     self._handle, ctypes.byref(self._overlapped), ctypes.byref(returned), True
                 )
@@ -1079,27 +1097,33 @@ class _DirectoryWatcher:
                     self.errors.append(f"GetOverlappedResult failed for {self.root}: {error}")
                     break
                 self._consume(int(returned.value))
-                if self.errors or self._stop.is_set() or not self._issue():
-                    break
+                with self._io_lock:
+                    if self.errors or self._stop.is_set() or not self._issue():
+                        break
         finally:
-            if self._event_handle:
-                kernel32.CloseHandle(self._event_handle)
-                self._event_handle = None
-            if self._handle:
-                kernel32.CloseHandle(self._handle)
-                self._handle = None
+            with self._io_lock:
+                if self._event_handle:
+                    kernel32.CloseHandle(self._event_handle)
+                    self._event_handle = None
+                if self._handle:
+                    kernel32.CloseHandle(self._handle)
+                    self._handle = None
 
-    def stop(self) -> None:
+    def stop(self, *, drained: bool = False) -> None:
         if self._thread is None:
             return
-        time.sleep(0.05)
-        self._stop.set()
-        if self._handle and self._overlapped is not None:
-            try:
-                kernel32 = self._kernel32()
-                kernel32.CancelIoEx(self._handle, ctypes.byref(self._overlapped))
-            except Exception as exc:
-                self.errors.append(f"CancelIoEx failed for {self.root}: {exc}")
+        if not drained:
+            time.sleep(0.05)
+        # Serialize cancellation with rearming and with handle disposal.
+        with self._io_lock:
+            if not self._stop.is_set():
+                self._stop.set()
+                if self._handle and self._overlapped is not None:
+                    kernel32 = self._kernel32()
+                    if not kernel32.CancelIoEx(self._handle, ctypes.byref(self._overlapped)):
+                        error = ctypes.get_last_error()
+                        if error != self.ERROR_NOT_FOUND:
+                            self.errors.append(f"CancelIoEx failed for {self.root}: {error}")
         self._thread.join(timeout=5)
         if self._thread.is_alive():
             self.errors.append(f"dependency watcher did not stop for {self.root}")
@@ -1150,11 +1174,13 @@ class _DependencyTreeGuard:
     def __init__(
         self,
         roots: list[Path],
-        *, strict_roots: tuple[Path, ...] = (),
+        *,
+        strict_roots: tuple[Path, ...] = (),
+        reserve_write_bursts: bool = False,
     ) -> None:
-        self.watchers = [_DirectoryWatcher(root) for root in roots]
+        self.watchers = [_DirectoryWatcher(root, reserve_write_bursts=reserve_write_bursts) for root in roots]
         self.strict_roots = frozenset(strict_roots)
-        self.strict_identities = {root: tree_object_identity(root) for root in strict_roots}
+        self.root_identities = {watcher.root: tree_object_identity(watcher.root) for watcher in self.watchers}
         self.drain_tokens: dict[Path, set[str]] = {}
 
     def ignores(self, watcher, name):
@@ -1162,22 +1188,26 @@ class _DependencyTreeGuard:
             return True
         return watcher.root not in self.strict_roots and _is_ephemeral_change(name)
 
-    def drain_strict(self) -> tuple[str, ...]:
+    def drain(self) -> tuple[str, ...]:
         errors = []
         for watcher in self.watchers:
-            if watcher.root not in self.strict_roots:
+            root = watcher.root
+            label = "Git object" if root in self.strict_roots else "Dependency"
+            identity = self.root_identities[root]
+            if (watcher._thread is None or not watcher._thread.is_alive() or watcher.errors
+                    or identity is None or tree_object_identity(root) != identity):
+                errors.append(f"{label} watcher unavailable: {root}")
                 continue
-            if watcher._thread is None or not watcher._thread.is_alive():
-                errors.append(f"Git object watcher unavailable: {watcher.root}")
-                continue
-            delivered, token = drain_watcher(watcher, watcher.root)
-            self.drain_tokens.setdefault(watcher.root, set()).add(token)
-            with _GUARDED_DRAIN_LOCK:
-                _GUARDED_DRAIN_PATHS.append((watcher.root / token, self.strict_identities[watcher.root]))
-                del _GUARDED_DRAIN_PATHS[:-512]
-            if not delivered or any(os.path.lexists(watcher.root / old)
-                                    for old in self.drain_tokens[watcher.root]):
-                errors.append(f"Git object watcher drain unconfirmed: {watcher.root}")
+            delivered, token = drain_watcher(watcher, root)
+            tokens = self.drain_tokens.setdefault(root, set())
+            tokens.add(token)
+            if root in self.strict_roots:
+                with _GUARDED_DRAIN_LOCK:
+                    _GUARDED_DRAIN_PATHS.append((root / token, identity))
+                    del _GUARDED_DRAIN_PATHS[:-512]
+            if (not delivered or watcher.errors or tree_object_identity(root) != identity
+                    or any(os.path.lexists(root / old) for old in tokens)):
+                errors.append(f"{label} watcher drain unconfirmed: {root}")
         return tuple(errors)
 
     def start(self) -> bool:
@@ -1192,9 +1222,10 @@ class _DependencyTreeGuard:
 
     def stop(self) -> GuardResult:
         mutations: list[str] = []
-        errors: list[str] = list(self.drain_strict())
+        drain_errors = self.drain()
+        errors = list(drain_errors)
         for watcher in self.watchers:
-            watcher.stop()
+            watcher.stop(drained=not drain_errors)
             errors.extend(watcher.errors)
             for _action, event in watcher.events:
                 if self.ignores(watcher, event):
@@ -1361,7 +1392,7 @@ def try_materialize_guarded_clone(
 
         if progress:
             progress(
-                "Ω guarded lower ready: sealed source/config copied privately; "
+                "Guarded lower ready: sealed source/config copied privately; "
                 f"dependencyRoots={len(dependency_root_paths)}, "
                 f"packageJunctions={len(junctions)}, sharedGitObjectRoots={len(git_objects)}, integrityHashPass=skipped"
             )
@@ -1459,7 +1490,7 @@ def peek_guarded_clone(target: Path) -> GuardResult:
         state = _ACTIVE.get(_key(target))
     if state is None or state.stopped is not None:
         return GuardResult(errors=("guarded lower continuity unavailable",))
-    errors = [*_git_object_mapping_errors(state), *state.guard.drain_strict()]
+    errors = [*_git_object_mapping_errors(state), *state.guard.drain()]
     notifications = []
     for watcher in state.guard.watchers:
         if watcher._thread is None or not watcher._thread.is_alive():

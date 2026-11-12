@@ -345,10 +345,11 @@ def runtime_env_for_path(
 
 
 def normalize_npm_range(range_spec: str) -> str:
-    """Preserve npm comparator semantics while joining operator whitespace."""
-    if not isinstance(range_spec,str):
-        raise ValueError('npm range must be text')
-    return re.sub(r"([<>]=?|[~^=])\s+(?=[vV]?\d)",r"\1",range_spec.strip())
+    """Adapt npm comparator whitespace and legacy version prefixes for NpmSpec."""
+    if not isinstance(range_spec, str):
+        raise ValueError("npm range must be text")
+    normalized = re.sub(r"([<>]=?|[~^=])\s+(?=[vV]?\d)", r"\1", range_spec.strip())
+    return re.sub(r"(^|[\s|])([<>]=?|[~^=])?v(?=[0-9])", r"\1\2", normalized)
 
 
 def node_range_satisfied(range_spec: str, exact_version: str) -> bool:

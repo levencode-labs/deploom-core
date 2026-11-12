@@ -12,10 +12,12 @@ class PlatformAbsenceTests(unittest.TestCase):
   self.manifest={'name':'foreign','version':'1.0.0','os':['linux'],'cpu':['arm64'],'libc':['glibc']};self.make_archive()
   self.lock={'lockfileVersion':3,'packages':{'':{'dependencies':{'held':'1.0.0'}},'node_modules/held':{'version':'1.0.0','optionalDependencies':{'foreign':'^1.0.0'},'peerDependencies':{'absent-peer':'^1.0.0'},'peerDependenciesMeta':{'absent-peer':{'optional':True}}},'node_modules/foreign':{'version':'1.0.0','optional':True,'os':['linux'],'cpu':['arm64'],'integrity':self.sri,'resolved':'https://registry.npmjs.org/foreign/-/foreign-1.0.0.tgz'}}}
   self.rules={'schemaVersion':1,'kind':'NPM_V3_SRI_PLATFORM_ABSENCE_V1','host':self.host,'artifacts':[{'instance':'node_modules/foreign','archivePath':str(self.archive.resolve())}]}
- def make_archive(self):
+ def make_archive(self, root='package', extra_root=None):
   raw=json.dumps(self.manifest).encode()
   with tarfile.open(self.archive,'w:gz') as tf:
-   entry=tarfile.TarInfo('package/package.json');entry.size=len(raw);tf.addfile(entry,io.BytesIO(raw))
+   entry=tarfile.TarInfo(f'{root}/package.json');entry.size=len(raw);tf.addfile(entry,io.BytesIO(raw))
+   if extra_root is not None:
+    extra=tarfile.TarInfo(f'{extra_root}/README');extra.size=1;tf.addfile(extra,io.BytesIO(b'x'))
   self.sri='sha512-'+base64.b64encode(hashlib.sha512(self.archive.read_bytes()).digest()).decode()
  def compile(self):
   raw=json.dumps(self.lock).encode();return compile_npm_dependency_obligations(raw,raw,exact_targets={},changed_instances=[],delta_digest='a'*64,scope_digest='b'*64,optional_absence_rules=self.rules)
@@ -25,6 +27,35 @@ class PlatformAbsenceTests(unittest.TestCase):
   path=self.root/'node_modules/held';path.mkdir(parents=True);(path/'package.json').write_text(json.dumps({'name':'held',**self.lock['packages']['node_modules/held']}))
  def test_real_archive_enriches_missing_libc_preserves_full_denominator(self):
   plan=self.compile();self.physical();r=self.observe(plan);self.assertEqual(r['instanceCount'],2);self.assertEqual(r['observedInstanceCount'],1);self.assertEqual(r['platformInapplicableInstanceCount'],1);self.assertEqual(r['unknownCount'],0);self.assertFalse(r['fullAcceptance']);self.assertEqual(r['platformInapplicableInstances'][0]['platformMetadata']['libc'],['glibc'])
+ def test_archive_with_a_single_package_named_root_is_supported(self):
+  self.make_archive('foreign v1.0')
+  self.lock['packages']['node_modules/foreign']['integrity']=self.sri
+  plan=self.compile()
+  self.physical()
+  self.assertEqual(self.observe(plan)['platformInapplicableInstanceCount'],1)
+
+ def test_archive_with_multiple_top_level_roots_is_rejected(self):
+  self.make_archive('foreign',extra_root='other')
+  self.lock['packages']['node_modules/foreign']['integrity']=self.sri
+  with self.assertRaisesRegex(MaterializedDependencyObligationError,'ARCHIVE_ROOT_UNPROVEN'):self.compile()
+
+ def test_multiple_omissions_resolve_each_incoming_declaration_once(self):
+  from unittest.mock import patch
+  import npm_platform_obligations as platform
+  self.archive=self.root/'foreign2.tgz'
+  self.manifest={**self.manifest,'name':'foreign2'}
+  self.make_archive()
+  self.lock['packages']['node_modules/foreign2']={
+      **self.lock['packages']['node_modules/foreign'],
+      'integrity':self.sri,'resolved':'https://registry.npmjs.org/foreign2/-/foreign2-1.0.0.tgz',
+  }
+  self.lock['packages']['node_modules/held']['optionalDependencies']['foreign2']='^1.0.0'
+  self.rules['artifacts'].append({'instance':'node_modules/foreign2','archivePath':str(self.archive.resolve())})
+  with patch.object(platform,'_resolve',wraps=platform._resolve) as resolve:
+   proof=verify_platform_absence(self.lock,self.rules)
+  self.assertEqual(set(proof),{'node_modules/foreign','node_modules/foreign2'})
+  self.assertEqual(resolve.call_count,4)
+
  def test_mutating_lock_os_cannot_self_authorize_absence(self):
   self.lock['packages']['node_modules/foreign']['os']=['darwin']
   with self.assertRaisesRegex(MaterializedDependencyObligationError,'PLATFORM_MISMATCH'):self.compile()

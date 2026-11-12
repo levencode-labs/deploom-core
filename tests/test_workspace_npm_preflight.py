@@ -104,6 +104,54 @@ class WorkspaceLockChecks(unittest.TestCase):
         runner.assert_not_called()
         self.assertEqual(result["code"], "UNAUTHORIZED_DECLARATION_DELTA")
 
+    def test_fixed_root_peer_conflicts_are_reported_without_npm(self):
+        root = {"workspaces": ["packages/*"],
+                "dependencies": {"peer": "1.0.0", "consumer": "1.0.0", "second": "1.0.0"}}
+        member = {"name": "app", "version": "1.0.0"}
+        consumer = {"version": "1.0.0", "peerDependencies": {"peer": "^1 || ^2"}}
+        lock = {"lockfileVersion": 3, "packages": {
+            "": root, "packages/app": member, "node_modules/peer": {"version": "1.0.0"},
+            "node_modules/consumer": consumer, "node_modules/second": consumer,
+        }}
+        inputs = {".": json.dumps(root).encode(), "packages/app": json.dumps(member).encode()}
+        assignment = {(".", "dependencies", name): version for name, version in root["dependencies"].items()}
+        target = (".", "dependencies", "peer")
+        assignment[target] = "2.0.0"
+        with patch("workspace_npm_preflight._workspace_npm_command") as npm:
+            result = run_workspace_npm_preflight(
+                inputs, json.dumps(lock).encode(), assignment, frozenset({target}),
+                artifacts=Path("unused"), cache=Path("unused"), registry="https://registry.npmjs.org/",
+            )
+        npm.assert_not_called()
+        self.assertEqual(result["code"], "HELD_LOCK_PROVIDER_CHANGED")
+        self.assertEqual(result["phase"], "BASELINE_ROOT_PEER_CHECK")
+        self.assertEqual(result["attempts"], [])
+        self.assertEqual(result["conflictCount"], 2)
+        self.assertEqual([row["path"] for row in result["heldConflicts"]],
+                         ["node_modules/consumer", "node_modules/second"])
+        self.assertEqual((result["dependency"], result["beforeVersion"], result["requestedVersion"]),
+                         ("peer", "1.0.0", "2.0.0"))
+
+    def test_held_root_peer_rejects_all_changed_versions_only_when_proved(self):
+        from workspace_npm_lock_delta import forced_root_peer_domain_conflicts
+
+        graph = {
+            "": {"dependencies": {"provider": "1.0.0", "consumer": "1.0.0", "shadowed": "1.0.0"}},
+            "node_modules/provider": {"version": "1.0.0"},
+            "node_modules/consumer": {"version": "1.0.0", "peerDependencies": {"provider": "*"}},
+            "node_modules/shadowed": {"version": "1.0.0", "peerDependencies": {"provider": "*"},
+                                      "dependencies": {"provider": "1.0.0"}},
+        }
+        alternatives = ("2.0.0", "2.1.0")
+        self.assertEqual(forced_root_peer_domain_conflicts(graph, {"provider": alternatives}), [
+            {"path": "node_modules/consumer", "dependency": "provider", "section": "peerDependencies",
+             "beforeVersion": "1.0.0", "requestedVersion": "2.0.0", "requestedVersions": list(alternatives)},
+        ])
+        for domains in ({"provider": ("1.0.0", *alternatives)}, {"provider": ()},
+                        {"provider": alternatives, "consumer": ()}):
+            with self.subTest(domains=domains):
+                self.assertEqual(forced_root_peer_domain_conflicts(graph, domains), [])
+
     def test_existing_root_overrides_reach_npm_unchanged(self):
         overrides = {"parent@^1": {".": "1.2.0", "@scope/child": "$@scope/child"}}
         root = {"workspaces": ["packages/*"], "dependencies": {"@scope/child": "1.0.0"},

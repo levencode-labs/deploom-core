@@ -21,6 +21,7 @@ Deploom Core is a headless Python engine for planning dependency upgrades in Jav
 - Distinguishes minimum changes needed for a health objective from newer choices within approved lines.
 - Preserves `pinned` versus `advisory` target authority, unchanged declarations, blockers, deferred work, and missing evidence.
 - Tracks source/workspace coverage and input identities so stale or partial plans remain visible.
+- Checks held npm peer providers and records lockfile changes, including when npm reclassifies a held package from production to development use.
 - Supports constrained npm workspace scenarios, but does **not** claim arbitrary monorepo, lockfile, or runtime correctness from a static assignment.
 
 A Draft proposal is **`PLANNING_ONLY` / `NOT_VERIFIED`**. An accepted lockfile, a clean install, effective dependency providers, project checks, and runtime acceptance are separate results.
@@ -70,4 +71,4 @@ Use the interpreter from your virtual environment if `python` resolves elsewhere
 | **[deploom-core](https://github.com/levencode-labs/deploom-core)** | Core decision and planning engine |
 | **[deploom-mcp](https://github.com/levencode-labs/deploom-mcp)** | MCP tools, Blueprint adapter, agent Skill, and authorized evidence workflows |
 
-**Release status:** the most recently verified public Core release when this README was prepared (2026-11-08) was [`v0.1.7`](https://github.com/levencode-labs/deploom-core/releases/tag/v0.1.7). For newer releases use the [Releases page](https://github.com/levencode-labs/deploom-core/releases/latest). Do not equate published binaries with acceptance on your own project.
+Download Core and the matching checksums from [GitHub Releases](https://github.com/levencode-labs/deploom-core/releases/latest). Run project acceptance on the final dependency tree.

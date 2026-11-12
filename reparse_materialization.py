@@ -11,6 +11,11 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
+try:
+    from _winapi import CreateJunction
+except ImportError:
+    CreateJunction = None
+
 
 class ReparseMaterializationError(RuntimeError):
     pass
@@ -132,24 +137,29 @@ def inventory_reparse_plan(
     def walk(directory: Path) -> None:
         nonlocal total_bytes
         try:
-            entries = sorted(os.scandir(directory), key=lambda item: item.name.lower())
+            with os.scandir(directory) as children:
+                entries = sorted(children, key=lambda item: item.name.lower())
         except OSError as exc:
             raise ReparseMaterializationError(
                 f"REPARSE_INVENTORY_UNREADABLE: {directory}: {exc}"
             ) from exc
         for item in entries:
-            path = Path(item.path)
             if item.name in excluded_files or item.name in excluded_dirs:
                 continue
-            try:
-                relative = path.relative_to(root)
-            except ValueError as exc:
-                raise ReparseMaterializationError(
-                    f"REPARSE_INVENTORY_ESCAPE: {path}"
-                ) from exc
-            if relative.as_posix() in excluded_paths:
+            if excluded_paths and Path(item.path).relative_to(root).as_posix() in excluded_paths:
                 continue
-            if is_reparse(path):
+            try:
+                item_stat = os.lstat(item.path)
+            except OSError as exc:
+                raise ReparseMaterializationError(
+                    f"REPARSE_ENTRY_UNREADABLE: {item.path}: {exc}"
+                ) from exc
+            mode = item_stat.st_mode
+            junction = (os.name == "nt"
+                        and getattr(item_stat, "st_reparse_tag", 0) == stat.IO_REPARSE_TAG_MOUNT_POINT)
+            if stat.S_ISLNK(mode) or junction:
+                path = Path(item.path)
+                relative = path.relative_to(root)
                 try:
                     target = path.resolve(strict=True)
                 except (OSError, RuntimeError) as exc:
@@ -193,20 +203,11 @@ def inventory_reparse_plan(
                 links.append(ReparseLink(
                     relative.as_posix(),
                     target_relative,
-                    "junction" if is_windows_junction(path) else (
-                        "symlink-directory" if target.is_dir() else "symlink-file"
-                    ),
+                    "junction" if junction else ("symlink-directory" if target.is_dir() else "symlink-file"),
                     authority,
                     package_name,
                 ))
                 continue
-            try:
-                item_stat = item.stat(follow_symlinks=False)
-                mode = item_stat.st_mode
-            except OSError as exc:
-                raise ReparseMaterializationError(
-                    f"REPARSE_ENTRY_UNREADABLE: {path}: {exc}"
-                ) from exc
             if stat.S_ISREG(mode):
                 total_bytes += item_stat.st_size
                 if maximum_copy_bytes is not None and total_bytes > maximum_copy_bytes:
@@ -216,7 +217,7 @@ def inventory_reparse_plan(
                         "no source bytes copied; configure DEPLOOM_SOURCE_COPY_MAX_BYTES "
                         "only after checking storage capacity (0 means unlimited)")
             if stat.S_ISDIR(mode):
-                walk(path)
+                walk(Path(item.path))
 
     walk(root)
     if capacity_destination is not None:
@@ -239,12 +240,26 @@ def _remove_destination(path: Path) -> None:
 
 
 def _create_junction(link: Path, target: Path) -> None:
-    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
-    if not comspec:
-        raise ReparseMaterializationError("REPARSE_JUNCTION_CREATE_UNAVAILABLE: cmd.exe")
     paths = {"DEPLOOM_JUNCTION_LINK": str(link), "DEPLOOM_JUNCTION_TARGET": str(target)}
     if any(any(ord(char) < 32 or char == '"' for char in value) for value in paths.values()):
         raise ReparseMaterializationError("REPARSE_JUNCTION_CREATE_INVALID_PATH")
+    if os.path.lexists(link):
+        raise ReparseMaterializationError(f"REPARSE_JUNCTION_DESTINATION_EXISTS: {link}")
+    if CreateJunction is not None:
+        try:
+            CreateJunction(str(target), str(link))
+        except OSError as exc:
+            raise ReparseMaterializationError(f"REPARSE_JUNCTION_CREATE_FAILED: {link} -> {target}: {exc}") from exc
+    else:
+        _create_junction_with_cmd(link, target, paths)
+    if not is_windows_junction(link) or link.resolve(strict=True) != target.resolve(strict=True):
+        raise ReparseMaterializationError(f"REPARSE_JUNCTION_TARGET_MISMATCH: {link} -> {target}")
+
+
+def _create_junction_with_cmd(link: Path, target: Path, paths: Mapping[str, str]) -> None:
+    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
+    if not comspec:
+        raise ReparseMaterializationError("REPARSE_JUNCTION_CREATE_UNAVAILABLE: cmd.exe")
     # cmd.exe does not parse the CRT's escaped quotes in a nested argv item.
     # Use a fixed command with separately supplied, quoted path variables.
     command = (subprocess.list2cmdline([comspec])
@@ -259,7 +274,7 @@ def _create_junction(link: Path, target: Path) -> None:
         timeout=30,
         check=False,
     )
-    if result.returncode != 0 or not is_windows_junction(link):
+    if result.returncode != 0:
         raise ReparseMaterializationError(
             f"REPARSE_JUNCTION_CREATE_FAILED: {link} -> {target}; exit={result.returncode}"
         )

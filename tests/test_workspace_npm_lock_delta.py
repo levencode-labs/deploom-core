@@ -48,6 +48,26 @@ class WorkspaceLockDeltaTests(unittest.TestCase):
         self.assertEqual(self.check()["code"], "LOCK_UNRELATED_NODE_DELTA")
         self.assertEqual(self.check(self.held)["code"], "LOCK_UNRELATED_NODE_DELTA")
 
+    def test_transitive_dev_flag_follows_proved_runtime_reachability(self):
+        for lock in (self.before, self.after):
+            packages = lock["packages"]
+            packages[""]["devDependencies"] = {"compile-only": "1.0.0"}
+            packages["node_modules/compile-only"] = {"version": "1.0.0", "dependencies": {"leaf": "^1"}}
+            packages["node_modules/leaf"] = {"version": "1.0.0"}
+        self.before["packages"]["node_modules/target"]["dependencies"]["compile-only"] = "^1"
+        self.after["packages"]["node_modules/compile-only"]["dev"] = True
+        self.after["packages"]["node_modules/leaf"]["dev"] = True
+        self.assertEqual(self.check()["status"], "RESOLUTION_PASSED")
+
+        self.after["packages"]["node_modules/leaf"]["dev"] = False
+        result = self.check()
+        self.assertEqual(result["code"], "LOCK_UNRELATED_NODE_DELTA")
+        self.assertEqual(result["path"], "node_modules/leaf")
+
+    def test_unchanged_runtime_reachability_cannot_authorize_dev_flip(self):
+        self.after["packages"]["node_modules/unrelated"]["dev"] = True
+        self.assertEqual(self.check()["code"], "LOCK_UNRELATED_NODE_DELTA")
+
     def test_held_artifact_cannot_change_at_same_version(self):
         self.after["packages"]["node_modules/held"]["integrity"] = "sha512-substituted"
         self.assertEqual(self.check(self.held)["code"], "HELD_LOCK_ARTIFACT_CHANGED")
@@ -92,6 +112,53 @@ class WorkspaceLockDeltaTests(unittest.TestCase):
             lock["packages"]["ui"] = {"peerDependencies": {"target": "^1 || ^2"}}
         self.assertEqual(self.check()["code"], "HELD_LOCK_PROVIDER_CHANGED")
         self.assertEqual(self.check()["path"], "ui")
+
+    def test_linked_workspace_preserves_only_unselected_child_edges(self):
+        child_target = ("app", "dependencies", "target")
+        root_link = (".", "dependencies", "app")
+        for lock, version in ((self.before, "1.0.0"), (self.after, "2.0.0")):
+            graph = lock["packages"]
+            graph[""]["dependencies"]["app"] = "*"
+            graph["app"]["version"] = "1.0.0"
+            graph["app"]["dependencies"]["target"] = version
+        deltas = {"": {"dependencies": {"target": "2.0.0"}},
+                  "app": {"dependencies": {"target": "2.0.0"}}}
+        assignment = {**self.assignment, child_target: "2.0.0", root_link: "1.0.0"}
+        selected = {self.target, child_target}
+        result = check_workspace_lock_delta(self.before, self.after, deltas, assignment, selected, None)
+        self.assertEqual(result["status"], "RESOLUTION_PASSED", result)
+
+        for lock in (self.before, self.after):
+            lock["packages"]["app"]["peerDependencies"] = {"related": "^1 || ^2"}
+        result = check_workspace_lock_delta(self.before, self.after, deltas, assignment, selected, None)
+        self.assertEqual(result["code"], "HELD_LOCK_PROVIDER_CHANGED", result)
+        self.assertEqual((result["path"], result["dependency"], result["section"]), ("app", "related", "peerDependencies"))
+
+    def test_unrelated_churn_reports_held_peer_conflict_in_same_receipt(self):
+        for lock in (self.before, self.after):
+            lock["packages"]["node_modules/held"]["peerDependencies"] = {"target": "^1 || ^2"}
+        self.after["packages"]["node_modules/unrelated"]["devOptional"] = True
+
+        result = self.check()
+
+        self.assertEqual(result["code"], "LOCK_UNRELATED_NODE_DELTA")
+        self.assertEqual(result["path"], "node_modules/unrelated")
+        self.assertEqual(result["heldConflict"], {
+            "status": "RESOLUTION_FAILED", "code": "HELD_LOCK_PROVIDER_CHANGED",
+            "path": "node_modules/held", "dependency": "target", "section": "peerDependencies",
+        })
+
+    def test_all_independent_held_conflicts_are_reported_in_one_receipt(self):
+        for lock in (self.before, self.after):
+            packages = lock["packages"]
+            packages["node_modules/held"]["peerDependencies"] = {"target": "^1 || ^2"}
+            packages["node_modules/unrelated"]["dependencies"] = {"related": "^1 || ^2"}
+
+        result = self.check()
+        self.assertEqual(result["code"], "HELD_LOCK_PROVIDER_CHANGED")
+        self.assertEqual(result["heldConflictCount"], 2)
+        self.assertEqual([(row["path"], row["dependency"]) for row in result["heldConflicts"]],
+                         [("node_modules/held", "target"), ("node_modules/unrelated", "related")])
 
     def test_workspace_link_and_unapproved_manifest_edit_are_rejected(self):
         self.after["packages"]["node_modules/app"]["resolved"] = "unrelated"

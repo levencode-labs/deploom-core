@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
+from functools import lru_cache
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import threading
 from pathlib import Path
@@ -502,6 +504,11 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
     from semantic_version import NpmSpec, Version
     from project_runtime import normalize_npm_range
     import time
+
+    @lru_cache(maxsize=1024)
+    def parse_range(spec):
+        return NpmSpec(normalize_npm_range(spec))
+
     def budget():
         if deadline is not None and time.monotonic() >= deadline:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_DEADLINE_EXCEEDED')
@@ -524,12 +531,14 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
             observed = path.lstat()
         except FileNotFoundError:
             return
-        if is_reparse(path) or getattr(observed, "st_file_attributes", 0) & 0x400:
+        if (stat.S_ISLNK(observed.st_mode)
+                or getattr(observed, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_REPARSE_UNPROVEN')
+        return observed
 
     lock = project / 'package-lock.json'
-    no_link(lock)
-    lock_bytes = lock.read_bytes() if lock.is_file() else b""
+    lock_info = no_link(lock)
+    lock_bytes = lock.read_bytes() if lock_info and stat.S_ISREG(lock_info.st_mode) else b""
     if _sha256_bytes(lock_bytes) != plan['approvedLockSha256']:
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LOCK_DRIFT')
     locked=_obligation_json(lock_bytes, 32 * 1024 * 1024 if workspace else 8 * 1024 * 1024)
@@ -607,25 +616,26 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
     if auxiliary_directory_observer is not None and not callable(auxiliary_directory_observer):
         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_AUXILIARY_OBSERVER_INVALID')
     observed_links = {}
+    manifest_size_limit = 1024 * 1024
+
     def scan_modules(directory, depth=0):
         nonlocal manifest_bytes_read
         budget()
         if depth > 64:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_DEPTH_LIMIT')
-        no_link(directory)
-        if not directory.exists():
+        if no_link(directory) is None:
             return
         for entry in sorted(directory.iterdir(), key=lambda p: p.name):
             if entry.name in {'.bin', '.package-lock.json'}:
                 continue
-            if entry.relative_to(project).as_posix() not in workspace_links:
-                no_link(entry)
+            relative = entry.relative_to(project).as_posix()
+            entry_info = None if relative in workspace_links else no_link(entry)
             # Only unscoped direct slots here: NEVER apply this predicate to
             # children inside @scope, where dot names may denote packages.
-            if entry.name.startswith('.') and entry.name not in {'.','..'} and entry.is_dir():
-                relative=entry.relative_to(project).as_posix()
+            is_directory = entry_info is not None and stat.S_ISDIR(entry_info.st_mode)
+            if entry.name.startswith('.') and entry.name not in {'.','..'} and is_directory:
                 if relative.casefold() not in locked_paths_folded:
-                    first=entry.lstat()
+                    first = entry_info
                     if getattr(first,'st_file_attributes',0)&0x400:
                         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_REPARSE_UNPROVEN')
                     if not any(entry.iterdir()):
@@ -638,7 +648,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                             'emptyObserved':True,'linkFreeObserved':True})
                         continue
             if entry.name.startswith('@'):
-                if not entry.is_dir():
+                if not is_directory:
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LAYOUT_UNPROVEN')
                 paths = sorted(entry.iterdir(), key=lambda p: p.name)
             else:
@@ -657,19 +667,25 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                         raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_WORKSPACE_LINK_MISMATCH')
                     observed_links[relative] = link["owner"]
                     continue
-                no_link(package)
-                if relative.casefold() in folded or not package.is_dir() or len(actual) >= 10000:
+                package_info = entry_info if package == entry else no_link(package)
+                if (relative.casefold() in folded or package_info is None
+                        or not stat.S_ISDIR(package_info.st_mode) or len(actual) >= 10000):
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_LAYOUT_UNPROVEN')
                 folded.add(relative.casefold())
-                package_file = package / 'package.json'; no_link(package_file)
-                if not package_file.is_file():
+                package_file = package / 'package.json'
+                file_info = no_link(package_file)
+                if file_info is None or not stat.S_ISREG(file_info.st_mode):
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_PACKAGE_MISSING')
-                if package_file.stat().st_size > 1024*1024:
+                if file_info.st_size > manifest_size_limit:
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_SIZE_LIMIT')
-                raw = package_file.read_bytes(); manifest_bytes_read += len(raw)
+                with package_file.open("rb") as stream:
+                    raw = stream.read(file_info.st_size + 1)
+                if len(raw) != file_info.st_size:
+                    raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_DRIFT')
+                manifest_bytes_read += len(raw)
                 if manifest_bytes_read > 64*1024*1024:
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_MANIFEST_BUDGET_LIMIT')
-                value = _obligation_json(raw, 1024*1024)
+                value = _obligation_json(raw, manifest_size_limit)
                 _ordinary_npm_obligation_mode(value,bundle_verified=relative in bundle_paths)
                 actual[relative] = (value, _sha256_bytes(raw))
                 scan_modules(package / 'node_modules', depth+1)
@@ -714,7 +730,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
                     edges.append({'source':source,'name':name,'destination':matches[0],'peer':peer,'specifier':spec,
                         'outcome':'VERIFIED_PLATFORM_INAPPLICABLE'});return
             if optional_peer and (workspace or plan.get('optionalAbsenceRules')):
-                try:NpmSpec(normalize_npm_range(spec))
+                try:parse_range(spec)
                 except (ValueError,TypeError) as exc:
                     raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_OPTIONAL_PEER_RANGE_UNPROVEN') from exc
                 edges.append({'source':source,'name':name,'destination':None,'peer':True,'specifier':spec,
@@ -728,7 +744,7 @@ def observe_npm_dependency_obligations(project_dir, plan, *, source_origin_diges
             wanted_name, spec = match.groups()
         provider = owner_manifests[observed_links[destination]] if destination in observed_links else actual[destination][0]
         try:
-            matched = NpmSpec(normalize_npm_range(spec)).match(Version(provider['version']))
+            matched = parse_range(spec).match(Version(provider['version']))
         except (ValueError, KeyError) as exc:
             raise MaterializedDependencyObligationError('DEPENDENCY_OBLIGATION_EDGE_UNPROVEN') from exc
         expected_name = wanted_name if wanted_name is not None else name

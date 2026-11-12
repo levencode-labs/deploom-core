@@ -9,9 +9,10 @@ def fetch_workspace_packuments(client, names):
 
     All selected names must have passed local slot/route validation first. Private
     sessions stay sequential. A stateful response discards speculative results
-    and lets the original session establish its ordered state. Workers have no
-    shared or durable cache and no progress callback; timed-out work cannot
-    publish into the caller after return. The HTTP supervisor owns its deadline.
+    and lets the original session establish its ordered state. Workers reuse
+    their connections across successful windows. They have no shared or durable
+    cache and no progress callback. Timed-out work cannot publish into the caller
+    after return. The HTTP supervisor owns its deadline.
     """
     from dependency_live_roadmap_generator import (
         DraftBudgetExceeded, RegistryInfrastructureError, _registry_prefetch_client,
@@ -22,26 +23,29 @@ def fetch_workspace_packuments(client, names):
     if len(names) < 2 or context[0] is None or not context[1] or deadline is None:
         return {name: client.fetch_npm_metadata(name) for name in names}
 
-    def fetch(name):
-        worker = _registry_prefetch_client(client)
-        worker.metadata_cache_dir = None
-        worker.metadata_cache_ttl = 0
-        worker.progress = lambda **kwargs: None
-        try:
-            return worker._fetch_npm_metadata_result(name)
-        finally:
-            worker.session.close()
-
+    workers = []
+    last = {}
     results = {}
-    # Never enqueue an unbounded tail behind four workers.
-    for offset in range(0, len(names), 4):
+    width = min(4, len(names))
+    pool = ThreadPoolExecutor(max_workers=width)
+    try:
         deadline.check('workspace-metadata')
-        window = names[offset:offset + 4]
-        pool = ThreadPoolExecutor(max_workers=len(window))
-        stateful = False
-        errors = {}
-        try:
-            futures = {pool.submit(fetch, name): name for name in window}
+        for _ in range(width):
+            worker = _registry_prefetch_client(client)
+            workers.append(worker)
+            worker.metadata_cache_dir = None
+            worker.metadata_cache_ttl = 0
+            worker.progress = lambda **kwargs: None
+
+        for offset in range(0, len(names), width):
+            deadline.check('workspace-metadata')
+            stateful = False
+            errors = {}
+            futures = {}
+            for index, name in enumerate(names[offset:offset + width]):
+                future = pool.submit(workers[index]._fetch_npm_metadata_result, name)
+                futures[future] = name
+                last[index] = future
             for future in as_completed(futures, timeout=max(0, deadline.remaining)):
                 name = futures[future]
                 try:
@@ -50,13 +54,22 @@ def fetch_workspace_packuments(client, names):
                     stateful |= not reusable
                 except RegistryInfrastructureError as exc:
                     errors[name] = exc
-        except TimeoutError:
-            raise DraftBudgetExceeded('workspace-metadata') from None
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-        deadline.check('workspace-metadata')
-        if stateful or request_context(client.session, client.registry, client.metadata_cache_tool_version) != context:
-            return {name: client.fetch_npm_metadata(name) for name in names}
-        if errors:
-            raise errors[sorted(errors)[0]]
-    return {name: results[name] for name in names}
+            deadline.check('workspace-metadata')
+            if stateful or request_context(client.session, client.registry, client.metadata_cache_tool_version) != context:
+                break
+            if errors:
+                raise errors[sorted(errors)[0]]
+        else:
+            return {name: results[name] for name in names}
+    except TimeoutError:
+        raise DraftBudgetExceeded('workspace-metadata') from None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        for index, worker in enumerate(workers):
+            future = last.get(index)
+            if future is None:
+                worker.session.close()
+            else:
+                # On timeout the last request can still own this session.
+                future.add_done_callback(lambda _, session=worker.session: session.close())
+    return {name: client.fetch_npm_metadata(name) for name in names}

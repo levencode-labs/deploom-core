@@ -49,7 +49,13 @@ class CurrentWorkspaceVerificationTests(unittest.TestCase):
             deadline=options.get('deadline',time.time()+60),materialize=True)
 
     def test_fresh_command_runs_in_actual_workspace_and_closes_capture(self):
-        value=self.invoke("console.log(process.cwd());")
+        import source_snapshot
+        with patch.object(source_snapshot, "build_source_tree_manifest",
+                          wraps=source_snapshot.build_source_tree_manifest) as scans:
+            value=self.invoke("console.log(process.cwd());")
+        self.assertFalse(any(call.kwargs.get("progress_label") == "hot SourceSnapshot live-source continuity"
+                             for call in scans.call_args_list))
+        self.assertNotIn(source_snapshot._active_key(self.project), source_snapshot._LIVE_SOURCE_WATCHERS)
         row=value['commandObservations'][0]
         expected=hashlib.sha256((str(self.project.resolve())+'\n').encode()).hexdigest()
         self.assertEqual(row['stdoutDigest'],expected)

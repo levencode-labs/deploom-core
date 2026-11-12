@@ -25,7 +25,9 @@ from project_runtime import normalize_npm_range
 from resolution_inventory import npm_lock_resolved_instance, npm_lock_resolution_slots
 from workspace_peer_model import Declaration
 from workspace_glob import match_workspace_pattern
-from workspace_npm_lock_delta import INSTALL_SECTIONS, check_workspace_lock_delta, peer_context
+from workspace_npm_lock_delta import (
+    INSTALL_SECTIONS, check_workspace_lock_delta, forced_root_peer_conflicts, peer_context,
+)
 
 
 def check_workspace_lock(packages: dict, assignment: dict[Declaration, str], *, check_declared_peers=True) -> dict:
@@ -366,6 +368,13 @@ def run_workspace_npm_preflight(
                 lock_owner = "" if owner == "." else owner
                 manifest_deltas.setdefault(lock_owner, {}).setdefault(section, {})[name] = expected
                 changed.add(key)
+        if not projects["."].get("overrides"):
+            root_targets = {name: assignment[owner, section, name] for owner, section, name in changed if owner == "."}
+            conflicts = forced_root_peer_conflicts(packages, root_targets, reauthored=reauthor)
+            if conflicts:
+                return {**evidence, "status": "RESOLUTION_FAILED", "code": "HELD_LOCK_PROVIDER_CHANGED",
+                        "phase": "BASELINE_ROOT_PEER_CHECK", "attempts": [], **conflicts[0],
+                        "conflictCount": len(conflicts), "heldConflicts": conflicts[:8]}
     except (AttributeError, KeyError, TypeError, ValueError):
         return {**evidence, "status": "UNKNOWN", "code": "INVALID_WORKSPACE_PREFLIGHT_INPUT"}
 

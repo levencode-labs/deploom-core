@@ -264,7 +264,10 @@ def _drain_watcher(
             created_directory = True
         except FileExistsError:
             pass
-        marker.write_text("drain", encoding="utf-8")
+        if marker_directory.resolve(strict=True) != marker_directory.absolute():
+            return False
+        with marker.open("x", encoding="utf-8") as stream:
+            stream.write("drain")
         if barrier_paths is not None:
             barrier_paths.add(marker.relative_to(root).as_posix())
             if created_directory:
@@ -276,9 +279,10 @@ def _drain_watcher(
         return False
     deadline = time.monotonic() + max(0.05, float(timeout_seconds))
     delivered = False
+    relative_marker = marker.relative_to(root).as_posix()
     try:
         while time.monotonic() < deadline:
-            if any(token in relative for _action, relative in list(watcher.events)):
+            if any(relative.replace("\\", "/") == relative_marker for _action, relative in list(watcher.events)):
                 delivered = True
                 break
             if watcher.errors:
@@ -1158,6 +1162,7 @@ def _capture_once(
     timeout_seconds: int,
     progress: Optional[ProgressCallback],
     progress_interval_seconds: int,
+    retain_live_watcher: bool,
 ) -> SourceSnapshot:
     started = time.monotonic()
     deadline = (float("inf") if timeout_seconds == 0
@@ -1195,6 +1200,7 @@ def _capture_once(
     from verification_storage_maintenance import register_trial_owner
     register_trial_owner(container)
     snapshot_root = container / "tree"
+    live_watcher = None
     try:
         try:
             method = materialize_private_tree(
@@ -1234,6 +1240,8 @@ def _capture_once(
             progress_interval_seconds=progress_interval_seconds,
             pass_role="sealed-snapshot",
         )
+        if retain_live_watcher:
+            live_watcher = _arm_live_source_watcher(capture_root, project_path)
         post = build_source_tree_manifest(
             capture_root,
             policy=policy,
@@ -1279,7 +1287,7 @@ def _capture_once(
             }, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
         )
-        return SourceSnapshot(
+        snapshot = SourceSnapshot(
             original_project_path=project_dir.resolve(),
             capture_root=capture_root,
             project_relative=project_relative,
@@ -1298,10 +1306,18 @@ def _capture_once(
             created_at=time.time(),
             input_policy=policy,
         )
+        if live_watcher is not None and _retain_live_source_watcher(
+            snapshot, live_watcher, capture_root, project_path
+        ):
+            live_watcher = None
+        return snapshot
     except Exception:
         _force_rmtree(container)
         _ALL_CONTAINERS.discard(container)
         raise
+    finally:
+        if live_watcher is not None:
+            live_watcher[0].stop()
 
 
 def _capture_source_snapshot_impl(
@@ -1311,6 +1327,7 @@ def _capture_source_snapshot_impl(
     timeout_seconds: int = 1800,
     progress: Optional[ProgressCallback] = None,
     progress_interval_seconds: int = 15,
+    retain_live_watcher: bool = False,
 ) -> SourceSnapshot:
     deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + max(1, timeout_seconds)
     last: Optional[BaseException] = None
@@ -1324,6 +1341,7 @@ def _capture_source_snapshot_impl(
                 timeout_seconds=_remaining(deadline),
                 progress=progress,
                 progress_interval_seconds=progress_interval_seconds,
+                retain_live_watcher=retain_live_watcher,
             )
         except SourceCaptureError as exc:
             last = exc
@@ -1412,6 +1430,7 @@ def verification_source_snapshot_scope(
     reuse_completed: bool = False,
     recovery_directory: Optional[Path] = None,
     strict_cleanup: bool = False,
+    observe_live_source: bool = False,
 ):
     """Pin one source subject for identity, cache lookup and all attempt retries.
 
@@ -1421,6 +1440,8 @@ def verification_source_snapshot_scope(
     from consuming a stale epoch belonging to another verification.
     strict_cleanup requires an owned non-reused scope and confirms physical
     container retirement; legacy scopes retain their best-effort cleanup.
+    observe_live_source retains the initial live comparison for later
+    boundaries in this owned invocation, with ordinary watcher fallback.
     """
     existing = active_source_snapshot(project_dir)
     if strict_cleanup and (existing is not None or reuse_completed):
@@ -1453,6 +1474,7 @@ def verification_source_snapshot_scope(
             snapshot = capture_source_snapshot(
                 project_dir, timeout_seconds=timeout_seconds, progress=progress,
                 progress_interval_seconds=progress_interval_seconds,
+                _retain_live_watcher=reuse_completed or observe_live_source,
             )
             reused = False
     else:
@@ -1537,6 +1559,41 @@ def _retire_live_source_watcher(snapshot: SourceSnapshot) -> None:
         entry[1].stop()
 
 
+def _arm_live_source_watcher(live_root: Path, live_project: Path):
+    if os.name != "nt":
+        return None
+    root_identity = _tree_object_identity(live_root)
+    project_identity = _tree_object_identity(live_project)
+    if root_identity is None or project_identity is None:
+        return None
+    watcher = _DirectoryWatcher(live_root)
+    if watcher.start():
+        return watcher, root_identity, project_identity
+    watcher.stop()
+    return None
+
+
+def _retain_live_source_watcher(snapshot, candidate, live_root, live_project):
+    # Only the complete manifest comparison can establish the first boundary.
+    # Delivery and both identities must still match before publishing a watcher.
+    watcher, root_identity, project_identity = candidate
+    if watcher.errors or not _drain_watcher(watcher, live_root):
+        return False
+    if (
+        not watcher._thread or not watcher._thread.is_alive()
+        or watcher.errors or _content_relevant_events(list(watcher.events))
+        or _tree_object_identity(live_root) != root_identity
+        or _tree_object_identity(live_project) != project_identity
+    ):
+        return False
+    key = _active_key(snapshot.original_project_path)
+    with _LOCK:
+        if key in _LIVE_SOURCE_WATCHERS:
+            return False
+        _LIVE_SOURCE_WATCHERS[key] = snapshot, watcher, root_identity, project_identity
+    return True
+
+
 def source_snapshot_live_source_continuity(
     snapshot: SourceSnapshot,
     *,
@@ -1575,6 +1632,9 @@ def source_snapshot_live_source_continuity(
             and thread.is_alive()
             and not watcher.errors
             and _drain_watcher(watcher, live_root)
+            and not watcher.errors
+            and _tree_object_identity(live_root) == sealed_root_identity
+            and _tree_object_identity(live_project) == sealed_project_identity
         )
         if not delivery_and_identity_ok:
             # Diagnostic facts only: never rescan/re-arm to recover this lost
@@ -1642,20 +1702,7 @@ def source_snapshot_live_source_continuity(
         if stale is not None:
             stale[1].stop()
 
-    candidate_watcher = None
-    sealed_root_identity = None
-    sealed_project_identity = None
-    if os.name == "nt":
-        candidate_watcher = _DirectoryWatcher(live_root)
-        if not candidate_watcher.start():
-            candidate_watcher.stop()
-            candidate_watcher = None
-        else:
-            sealed_root_identity = _tree_object_identity(live_root)
-            sealed_project_identity = _tree_object_identity(live_project)
-            if sealed_root_identity is None or sealed_project_identity is None:
-                candidate_watcher.stop()
-                candidate_watcher = None
+    candidate_watcher = _arm_live_source_watcher(live_root, live_project)
 
     try:
         observed = build_source_tree_manifest(
@@ -1665,14 +1712,14 @@ def source_snapshot_live_source_continuity(
             progress=progress,
             progress_label="hot SourceSnapshot live-source continuity",
         )
-    except SourceCaptureError:
+    except BaseException:
         if candidate_watcher is not None:
-            candidate_watcher.stop()
+            candidate_watcher[0].stop()
         raise
 
     if observed.key != snapshot.manifest_key:
         if candidate_watcher is not None:
-            candidate_watcher.stop()
+            candidate_watcher[0].stop()
         emit_observability_event(
             "source.snapshot.live-continuity",
             snapshotKey=snapshot.key,
@@ -1682,23 +1729,9 @@ def source_snapshot_live_source_continuity(
         return False
 
     if candidate_watcher is not None:
-        armed_clean = bool(
-            _tree_object_identity(live_root) == sealed_root_identity
-            and _tree_object_identity(live_project) == sealed_project_identity
-            and _drain_watcher(candidate_watcher, live_root)
-            and not candidate_watcher.errors
-            and not _content_relevant_events(list(candidate_watcher.events))
-        )
-        if not armed_clean:
-            candidate_watcher.stop()
+        if not _retain_live_source_watcher(snapshot, candidate_watcher, live_root, live_project):
+            candidate_watcher[0].stop()
             return False
-        with _LOCK:
-            _LIVE_SOURCE_WATCHERS[key] = (
-                snapshot,
-                candidate_watcher,
-                sealed_root_identity,
-                sealed_project_identity,
-            )
         outcome = "manifest-match-watcher-armed"
     else:
         # No proven event stream => this one continuation is authorized only by
@@ -2252,6 +2285,7 @@ def capture_source_snapshot(
     timeout_seconds: int = 1800,
     progress: Optional[ProgressCallback] = None,
     progress_interval_seconds: int = 15,
+    _retain_live_watcher: bool = False,
 ) -> SourceSnapshot:
     capture_root, _project_relative, _git_head = _subject_layout(project_dir)
     if policy is None:
@@ -2265,6 +2299,7 @@ def capture_source_snapshot(
                 timeout_seconds=timeout_seconds,
                 progress=progress,
                 progress_interval_seconds=progress_interval_seconds,
+                retain_live_watcher=_retain_live_watcher,
             )
 
     operation_id = new_observability_id("source-capture")
@@ -2283,6 +2318,7 @@ def capture_source_snapshot(
             timeout_seconds=timeout_seconds,
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
+            retain_live_watcher=_retain_live_watcher,
         )
     except BaseException as exc:
         after = process_resource_snapshot()

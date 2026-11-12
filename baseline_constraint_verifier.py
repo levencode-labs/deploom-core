@@ -2575,6 +2575,27 @@ def _is_exact_assignment_version(target: str) -> bool:
         return False
 
 
+def _npm_targets_require_physical_resolver(project: Path, assignment: Mapping[str, str]) -> bool:
+    if not assignment:
+        return False
+    try:
+        manifest = json.loads((project / "package.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return True
+    direct = set()
+    for section in ("dependencies", "devDependencies"):
+        declarations = manifest.get(section)
+        if isinstance(declarations, dict):
+            direct.update(declarations)
+    optional = manifest.get("optionalDependencies")
+    if isinstance(optional, dict):
+        direct.difference_update(optional)
+    return not (
+        direct.issuperset(assignment)
+        and all(_is_exact_assignment_version(version) for version in assignment.values())
+    )
+
+
 def _assignment_observation_semantics(config: BaselineVerifyConfig, assignment: Mapping[str, str]) -> str:
     if (_verification_purpose(config) == "baseline-control"
             and any(not _is_exact_assignment_version(target) for target in assignment.values())):
@@ -3234,11 +3255,30 @@ def verify_assignment(
                     resolvedStateKey=proof_identity.resolved_state_key,
                 )
 
-        install = install_args_for_profile(
-            workspace_topology.profile,
-            ignore_scripts=True,
-            frozen=False,
+        def publish_resolver_pass() -> None:
+            assert resolved_state is not None
+            metadata = resolved_state_metadata(resolved_state)
+            publish_pass(
+                "resolver", proof_identity.resolver_input_key,
+                observed_versions, observed_hash, extra_metadata=metadata,
+            )
+            if stage_journal:
+                stage_journal.write("resolver-install", "PASS", metadata)
+
+        profile = workspace_topology.profile
+        # A pre-applied npm candidate can resolve its lock without a
+        # throwaway install. Exact mandatory pins are checked in the actual
+        # npm ci tree before they can be published as observed versions.
+        npm_lock_only = (
+            profile.family == "npm"
+            and run_project_checks and config.project_checks != "off" and bool(config.commands)
+            and not changed and not remove_packages and not config.lifecycle_scripts
+            and (package_manager_project / profile.lockfile_name).is_file()
+            and not _npm_targets_require_physical_resolver(workspace_project, assignment)
         )
+        install = install_args_for_profile(profile, ignore_scripts=True, frozen=False)
+        if npm_lock_only:
+            install.append("--package-lock-only")
         argv, _ = _command_prefix(executable, install)
         install_env = {
             "CI": "1",
@@ -3506,13 +3546,18 @@ def verify_assignment(
 
         if not resolver_reused:
             try:
-                observed_versions = observed_resolved_assignment(
-                    workspace_project,
-                    assignment,
-                    remove_packages=remove_packages,
-                    package_manager_root=package_manager_project,
-                    allow_declared_selectors=_verification_purpose(config) == "baseline-control",
-                )
+                if npm_lock_only:
+                    # Bind the prospective preparation to its expected pins;
+                    # the frozen install must independently observe this hash.
+                    observed_versions = dict(assignment)
+                else:
+                    observed_versions = observed_resolved_assignment(
+                        workspace_project,
+                        assignment,
+                        remove_packages=remove_packages,
+                        package_manager_root=package_manager_project,
+                        allow_declared_selectors=_verification_purpose(config) == "baseline-control",
+                    )
                 observed_hash = observed_resolved_hash(observed_versions)
             except ObservedResolutionError as exc:
                 event("verify.resolver.observed-drift", outcome="unknown", detail=str(exc))
@@ -3568,13 +3613,8 @@ def verify_assignment(
                 commands=config.commands if run_project_checks else (),
             )
             if resolver_publication_allowed:
-                publish_pass(
-                    "resolver",
-                    proof_identity.resolver_input_key,
-                    observed_versions,
-                    observed_hash,
-                    extra_metadata=resolved_state_metadata(resolved_state),
-                )
+                if not npm_lock_only:
+                    publish_resolver_pass()
             else:
                 event(
                     "proof.cache.publish-skipped",
@@ -3582,8 +3622,6 @@ def verify_assignment(
                     cacheKey=proof_identity.resolver_input_key,
                     reason="process-tree-supervision-not-guaranteed",
                 )
-            if stage_journal and resolver_publication_allowed:
-                stage_journal.write("resolver-install", "PASS", resolved_state_metadata(resolved_state))
             event(
                 "verify.resolved-state.captured",
                 resolvedStateKey=resolved_state.key,
@@ -4019,12 +4057,13 @@ def verify_assignment(
                 if full_result.returncode != 0:
                     tail = "\n".join(((full_result.stdout or "") + "\n" + (getattr(full_result, "stderr", "") or "")).splitlines()[-80:])
                     lifecycle_detail = f"lifecycle install exited {full_result.returncode}: " + "\n".join(tail.splitlines()[-14:])
+                    prospective_only = npm_lock_only and not resolver_reused
                     common = dict(
                         command=" ".join(full_argv),
                         output=tail,
                         workspace=str(workspace_project),
-                        observed_resolved_versions=observed_versions,
-                        observed_resolved_hash=observed_hash,
+                        observed_resolved_versions={} if prospective_only else observed_versions,
+                        observed_resolved_hash="" if prospective_only else observed_hash,
                         resolved_state_key=resolved_state.key if resolved_state is not None else "",
                         resolved_lockfile_path=resolved_state.lockfile_path if resolved_state is not None else "",
                         resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
@@ -4114,6 +4153,8 @@ def verify_assignment(
                         workspace=str(workspace_project),
                     )
                 if preparation_publication_allowed:
+                    if npm_lock_only and not resolver_reused and resolver_publication_allowed:
+                        publish_resolver_pass()
                     publish_pass(
                         "preparation",
                         proof_identity.preparation_proof_key,

@@ -29,6 +29,50 @@ def _edges(packages: dict, consumer: str) -> dict:
     return edges
 
 
+def _held_root_peer_bindings(packages, root_targets, *, reauthored=None):
+    if not root_targets:
+        return
+    root = packages[""]
+    authorized = set(root_targets)
+    if reauthored is not None and reauthored[0] == ".":
+        authorized.add(reauthored[2])
+    held_names = {name for section in INSTALL_SECTIONS for name in root.get(section, {})} - authorized
+    for consumer in sorted(held_names):
+        path = f"node_modules/{consumer}"
+        row = packages.get(path, {})
+        if row.get("link") or not row.get("version"):
+            continue
+        peers = row.get("peerDependencies", {})
+        for name in sorted(peers.keys() & root_targets.keys()):
+            if name in row.get("dependencies", {}) or name in row.get("optionalDependencies", {}):
+                continue
+            provider = npm_lock_resolved_instance(packages, name, "")
+            if provider is not None:
+                yield {"path": path, "dependency": name, "section": "peerDependencies",
+                       "beforeVersion": provider[1]}
+
+
+def forced_root_peer_conflicts(packages, root_targets, *, reauthored=None):
+    """An unchanged direct root consumer and a direct root peer have fixed slots."""
+    return [{**row, "requestedVersion": root_targets[row["dependency"]]}
+            for row in _held_root_peer_bindings(packages, root_targets, reauthored=reauthored)
+            if row["beforeVersion"] != root_targets[row["dependency"]]]
+
+
+def forced_root_peer_domain_conflicts(packages, root_domains):
+    """Identify held peers whose baseline version is absent from a known domain.
+
+    An empty domain here represents scope with candidate selection still
+    pending. Its declaration remains authorized, so it is not a held consumer.
+    """
+    conflicts = []
+    for row in _held_root_peer_bindings(packages, root_domains):
+        versions = root_domains[row["dependency"]]
+        if versions and row["beforeVersion"] not in versions:
+            conflicts.append({**row, "requestedVersion": versions[0], "requestedVersions": list(versions)})
+    return conflicts
+
+
 def _instance(packages, declaration):
     owner, _, name = declaration
     return npm_lock_resolved_instance(packages, name, "" if owner == "." else owner)
@@ -114,40 +158,81 @@ def _displaced_held_slots(before, after, held_pairs, replaced_slots):
 
 
 def _check_held_graph(before, after, before_edges, after_edges, owners, authorized, moves):
-    """Preserve the closure of every declaration outside the authorized delta."""
+    """Preserve held closure and report independent conflicts in one pass."""
     new_path = {old: new for new, old in moves.items()}
-    pending = deque((owner, True) for owner in sorted(owners))
-    visited = set()
+    pending = deque(sorted(owners))
+    visited = set(owners)
+    conflicts = []
+    conflict_count = 0
     while pending:
-        consumer, owner_seed = pending.popleft()
-        if not owner_seed:
-            if consumer in visited:
-                continue
-            visited.add(consumer)
+        consumer = pending.popleft()
         left = before_edges[consumer]
         right = after_edges[new_path.get(consumer, consumer)]
         for section, name in sorted(left.keys() | right.keys()):
-            if owner_seed and (consumer or ".", section, name) in authorized:
+            if consumer in owners and (consumer or ".", section, name) in authorized:
                 continue
             old_spec, old_provider = left.get((section, name), (None, None))
             new_spec, new_provider = right.get((section, name), (None, None))
             normalized = (moves.get(new_provider[0], new_provider[0]), new_provider[1]) if new_provider else None
+            old_entry = before[old_provider[0]] if old_provider else None
+            failure = None
             if (old_spec, old_provider) != (new_spec, normalized):
-                return {"status": "RESOLUTION_FAILED", "code": "HELD_LOCK_PROVIDER_CHANGED",
-                        "path": consumer, "dependency": name, "section": section}
-            if old_provider is None:
+                failure = "HELD_LOCK_PROVIDER_CHANGED"
+            elif old_entry is not None and _artifact(old_entry) != _artifact(after[new_provider[0]]):
+                failure = "HELD_LOCK_TRANSITIVE_ARTIFACT_CHANGED"
+            if failure is not None:
+                conflict_count += 1
+                if len(conflicts) < 8:
+                    conflicts.append({"status": "RESOLUTION_FAILED", "code": failure,
+                                      "path": consumer, "dependency": name, "section": section})
                 continue
-            old_entry = before[old_provider[0]]
-            if _artifact(old_entry) != _artifact(after[new_provider[0]]):
-                return {"status": "RESOLUTION_FAILED", "code": "HELD_LOCK_TRANSITIVE_ARTIFACT_CHANGED",
-                        "path": consumer, "dependency": name, "section": section}
+            if old_entry is None:
+                continue
             if old_entry.get("link"):
                 target = old_entry["resolved"].replace("\\", "/").strip("/")
             else:
                 target = old_provider[0]
             if target not in visited:
-                pending.append((target, False))
-    return None
+                visited.add(target)
+                pending.append(target)
+    if conflict_count > 1:
+        return {**conflicts[0], "heldConflictCount": conflict_count, "heldConflicts": conflicts}
+    return conflicts[0] if conflicts else None
+
+
+def _runtime_reachable(edges, owners):
+    reached = set(owners)
+    pending = deque(owners)
+    while pending:
+        consumer = pending.popleft()
+        for (section, _), (_, provider) in edges[consumer].items():
+            if section == "devDependencies" or provider is None:
+                continue
+            path, _ = provider
+            if path not in reached:
+                reached.add(path)
+                pending.append(path)
+    return reached
+
+
+def _proved_dev_reclassifications(paths, before, after, before_edges, after_edges, owners):
+    # npm reclassifies held payloads when their last production consumer changes.
+    candidates = []
+    for path in paths & before.keys() & after.keys():
+        old, new = before[path], after[path]
+        old_dev, new_dev = old.get("dev", False), new.get("dev", False)
+        if (type(old_dev) is bool and type(new_dev) is bool and old_dev != new_dev
+                and {key: value for key, value in old.items() if key != "dev"}
+                == {key: value for key, value in new.items() if key != "dev"}):
+            candidates.append((path, old_dev, new_dev))
+    if not candidates:
+        return set()
+    runtime_before = _runtime_reachable(before_edges, owners)
+    runtime_after = _runtime_reachable(after_edges, owners)
+    return {
+        path for path, old_dev, new_dev in candidates
+        if old_dev == (path not in runtime_before) and new_dev == (path not in runtime_after)
+    }
 
 
 def check_workspace_lock_delta(
@@ -232,12 +317,17 @@ def check_workspace_lock_delta(
                 if provider is not None and provider[0] not in impacted:
                     impacted.add(provider[0])
                     queue.append(provider[0])
-    outside = sorted(delta - impacted - relocated)
+    outside = delta - impacted - relocated
     if outside:
-        return {"status": "RESOLUTION_FAILED", "code": "LOCK_UNRELATED_NODE_DELTA",
-                "path": outside[0], "unrelatedCount": len(outside)}
-
+        outside -= _proved_dev_reclassifications(outside, before, after, before_edges, after_edges, owners)
     held_failure = _check_held_graph(before, after, before_edges, after_edges, owners, seeds, moves | displaced)
+    if outside:
+        result = {"status": "RESOLUTION_FAILED", "code": "LOCK_UNRELATED_NODE_DELTA",
+                  "path": min(outside), "unrelatedCount": len(outside)}
+        if held_failure is not None:
+            result["heldConflict"] = held_failure
+        return result
+
     if held_failure is not None:
         return held_failure
 

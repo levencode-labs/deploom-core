@@ -46,6 +46,15 @@ class LiveContinuityDiagnosticTests(unittest.TestCase):
         self.check_failure(alive=False,expected='THREAD')
     def test_equal_bytes_after_directory_swap_do_not_preserve_identity(self):
         self.check_failure(swap=True,expected='IDENTITY')
+    @unittest.skipUnless(os.name == "nt", "actual Windows recursive watcher boundary")
+    def test_capture_reuses_live_manifest_and_detects_late_source_edit(self):
+        snapshot = core.capture_source_snapshot(self.project, timeout_seconds=15, _retain_live_watcher=True)
+        self.addCleanup(core._retire_completed_request, snapshot)
+        with patch.object(core, "build_source_tree_manifest", side_effect=AssertionError("unexpected live rehash")):
+            self.assertTrue(core.source_snapshot_live_source_continuity(snapshot, timeout_seconds=5))
+        (self.project / "source.txt").write_text("changed", encoding="utf-8")
+        self.assertFalse(core.source_snapshot_live_source_continuity(snapshot, timeout_seconds=5))
+
     @unittest.skipUnless(os.name=='nt','actual Windows recursive watcher boundary')
     def test_actual_excluded_tree_activity_preserves_source_continuity(self):
         with core.verification_source_snapshot_scope(self.project,timeout_seconds=15,strict_cleanup=True) as snapshot:

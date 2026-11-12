@@ -65,13 +65,15 @@ def declaration_id(declaration: Declaration) -> str:
 def workspace_providers_from_lock(
     packages: dict,
     domains: Mapping[Declaration, WorkspaceDomain],
+    *,
+    shared_slots: frozenset[str] = frozenset(),
 ) -> dict[tuple[Declaration, str], Declaration | LockedWorkspacePeer | None]:
     """Find provider variables or fixed registry versions in the observed lock.
 
     Follow the consumer package location, not the declaration owner's lookup.
     Declarations held at the same locked instance have the same provider version.
-    Leave shared placements with a mutable declaration unbound, because the
-    next install may re-layout them. Explicit absence is available only for a
+    Bind a mutable shared placement only when the planner will enforce one
+    version across its declarations. Explicit absence is available only for a
     lock-documented optional peer with no matching slot. These bindings only
     describe this lock.
     """
@@ -102,7 +104,8 @@ def workspace_providers_from_lock(
                 continue
             slot, version = instance
             matches = by_path.get((slot, peer), ())
-            if matches and (len(matches) == 1 or all(not domains[key].mutable for key in matches)):
+            if matches and (len(matches) == 1 or slot in shared_slots
+                            or all(not domains[key].mutable for key in matches)):
                 bindings[declaration, peer] = min(matches)
             elif not matches:
                 record = packages[slot]
@@ -200,6 +203,12 @@ def _constrain_workspace_owner_peers(model, packages, domains, effective_peer_ra
     return replace(model, constraints=tuple(constraints)), len(rows)
 
 
+def _selected_candidates(domain: WorkspaceDomain) -> tuple[WorkspaceCandidate, ...]:
+    return tuple(candidate for candidate in domain.candidates
+                 if (domain.mutable or candidate.version == domain.current)
+                 and (domain.exact_target is None or candidate.version == domain.exact_target))
+
+
 def compile_workspace_peer_model(
     domains: Mapping[Declaration, WorkspaceDomain],
     providers: Mapping[tuple[Declaration, str], Declaration | LockedWorkspacePeer | None],
@@ -219,9 +228,7 @@ def compile_workspace_peer_model(
     for key, domain in sorted(domains.items()):
         if domain.exact_target is not None and not domain.mutable and domain.exact_target != domain.current:
             raise ValueError(f"EXACT_TARGET_OUTSIDE_AUTHORITY: {key}")
-        candidates = tuple(candidate for candidate in domain.candidates
-                           if (domain.mutable or candidate.version == domain.current)
-                           and (domain.exact_target is None or candidate.version == domain.exact_target))
+        candidates = _selected_candidates(domain)
         versions = tuple(candidate.version for candidate in candidates)
         if not versions:
             raise WorkspaceModelUnknown(f"CANDIDATE_EVIDENCE_MISSING: {key}")
@@ -418,6 +425,21 @@ def _project_single_nested_slot(packages, domains, keys):
     return projected, slot
 
 
+def _constrain_shared_instances(model, groups, *, provenance):
+    variables = model.package_map()
+    requirements = list(model.requirements)
+    for group in groups:
+        first, *others = sorted(map(declaration_id, group))
+        for other in others:
+            for version in variables[first].domain:
+                allowed = (version,) if version in variables[other].domain else ()
+                requirements.append(RequiresAny(
+                    (first, version), other, allowed,
+                    reason=f"{first} and {other} share one npm instance", provenance=provenance,
+                ))
+    return replace(model, requirements=tuple(requirements))
+
+
 def plan_workspace_from_lock(
     packages: dict,
     domains: Mapping[Declaration, WorkspaceDomain],
@@ -459,36 +481,52 @@ def plan_workspace_from_lock(
                         for candidate in domain.candidates
                     )
                     domains[key] = replace(domain, candidates=candidates)
+        shared_slots = frozenset(
+            path for path, keys in instances.items()
+            if len(keys) > 1 and len({
+                frozenset(candidate.version for candidate in _selected_candidates(domains[key]))
+                for key in keys
+            }) == 1
+        )
         unknown_candidates = []
         model = compile_workspace_peer_model(
-            domains, workspace_providers_from_lock(packages, domains), environment=environment,
-            unknown_candidates=unknown_candidates)
+            domains, workspace_providers_from_lock(packages, domains, shared_slots=shared_slots),
+            environment=environment, unknown_candidates=unknown_candidates)
         model, owner_peer_count = _constrain_workspace_owner_peers(
             model, packages, domains, effective_peer_ranges)
         result["ownerPeerConstraintCount"] = owner_peer_count
         result["domain"] = _domain_evidence(model, unknown_candidates)
         variables = model.package_map()
+        unproven = {(row["owner"], row["section"], row["name"]) for row in unknown_candidates}
+        shared = []
         for path, keys in instances.items():
-            if len(keys) > 1:
-                candidate_sets = {variables[declaration_id(key)].domain for key in keys}
-                if len(candidate_sets) != 1 or len(next(iter(candidate_sets))) != 1:
-                    if propose_nested_slot and not effective_peer_ranges and health_solver is None:
-                        projection = _project_single_nested_slot(packages, domains, keys)
-                        if projection is not None:
-                            projected, slot = projection
-                            prepared = plan_workspace_from_lock(
-                                projected, domains, environment=environment, prepare_only=True,
-                                include_constraint_evidence=include_constraint_evidence,
-                            )
-                            if (isinstance(prepared, PreparedWorkspacePlan)
-                                    and prepared.result["domain"]["evidenceCoverage"] == "COMPLETE"):
-                                prepared = replace(prepared, result={
-                                    **prepared.result, "topology": "PROPOSED_INSTANCE_LAYOUT",
-                                    "proposedNestedSlot": slot,
-                                })
-                                return prepared if prepare_only else prepared.solve(
-                                    excluded_assignments, timeout_ms=timeout_ms)
-                    raise WorkspaceModelUnknown(f"SHARED_SLOT_RELAYOUT_UNMODELED: {path}")
+            if len(keys) == 1:
+                continue
+            if path in shared_slots:
+                if len(variables[declaration_id(keys[0])].domain) == 1:
+                    continue
+                if unproven.isdisjoint(keys):
+                    shared.append(keys)
+                    continue
+            if propose_nested_slot and not effective_peer_ranges and health_solver is None:
+                projection = _project_single_nested_slot(packages, domains, keys)
+                if projection is not None:
+                    projected, slot = projection
+                    prepared = plan_workspace_from_lock(
+                        projected, domains, environment=environment, prepare_only=True,
+                        include_constraint_evidence=include_constraint_evidence,
+                    )
+                    if (isinstance(prepared, PreparedWorkspacePlan)
+                            and prepared.result["domain"]["evidenceCoverage"] == "COMPLETE"):
+                        prepared = replace(prepared, result={
+                            **prepared.result, "topology": "PROPOSED_INSTANCE_LAYOUT",
+                            "proposedNestedSlot": slot,
+                        })
+                        return prepared if prepare_only else prepared.solve(
+                            excluded_assignments, timeout_ms=timeout_ms)
+            raise WorkspaceModelUnknown(f"SHARED_SLOT_RELAYOUT_UNMODELED: {path}")
+        if shared:
+            model = _constrain_shared_instances(model, shared, provenance="workspace-observed-instance")
     except WorkspaceModelUnknown as exc:
         return {**result, "status": "UNKNOWN", "reason": str(exc)}
 
@@ -526,19 +564,7 @@ def plan_workspace_in_topology(
     except WorkspaceModelUnknown as exc:
         return {**result, "status": "UNKNOWN", "reason": str(exc)}
 
-    variables = model.package_map()
-    requirements = list(model.requirements)
-    for group in instance_groups:
-        first, *others = sorted(map(declaration_id, group))
-        for other in others:
-            for version in variables[first].domain:
-                allowed = (version,) if version in variables[other].domain else ()
-                requirements.append(RequiresAny(
-                    (first, version), other, allowed,
-                    reason=f"{first} and {other} share one proposed instance",
-                    provenance="workspace-proposed-instance",
-                ))
-    model = PeerOptimizationModel(model.packages, model.constraints, tuple(requirements), model.objective_width)
+    model = _constrain_shared_instances(model, instance_groups, provenance="workspace-proposed-instance")
     prepared = PreparedWorkspacePlan(
         model, deepcopy(result),
         _constraint_evidence(model, domains) if include_constraint_evidence else None, health_solver,

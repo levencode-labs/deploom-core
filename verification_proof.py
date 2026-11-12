@@ -869,9 +869,10 @@ def _resolver_ancestor_files(project_dir: Path) -> list[tuple[str, str]]:
 
 def _user_config_files(environment: Mapping[str, str]) -> list[tuple[str, str]]:
     candidates: set[Path] = set()
-    explicit = environment.get("NPM_CONFIG_USERCONFIG") or environment.get("npm_config_userconfig")
-    if explicit:
-        candidates.add(Path(explicit).expanduser())
+    for key in ("NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG"):
+        explicit = environment.get(key) or environment.get(key.lower())
+        if explicit:
+            candidates.add(Path(explicit).expanduser())
     for key in ("HOME", "USERPROFILE"):
         raw = environment.get(key)
         if not raw:

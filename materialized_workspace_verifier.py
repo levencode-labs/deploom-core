@@ -40,6 +40,11 @@ def _sha(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def _sha_file(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 def verify_current_workspace(project_dir, *, expected_source_key, dependency_plan,
         commands, cache_dir, deadline, final_profile_digest, environment=None, materialize=False,
         environment_contract='LEGACY_INHERITED_ENV_V1', trusted_pre_popen_guard=None, command_cache_directories=None,
@@ -116,7 +121,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
         node,npm_entry=_npm_command(path=env.get('PATH'));npm=Path(npm_entry)
     except OSError:
         fail('CURRENT_WORKSPACE_TOOLCHAIN_UNAVAILABLE')
-    tools={'nodeSha256':_sha(Path(node).read_bytes()),'npmCliSha256':_sha(npm.read_bytes())}
+    tools={'nodeSha256':_sha_file(node),'npmCliSha256':_sha_file(npm)}
     lock_path = project / "package-lock.json"
     if workspace_mode:
         info = lock_path.lstat()
@@ -168,7 +173,9 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
                 or getattr(x,'timed_out',False) or getattr(x,'cancelled',False)):
             fail('CURRENT_WORKSPACE_PROCESS_CLOSURE_UNPROVEN')
         return x
-    with verification_source_snapshot_scope(project,timeout_seconds=remaining(),strict_cleanup=True) as snapshot:
+    with verification_source_snapshot_scope(
+        project, timeout_seconds=remaining(), strict_cleanup=True, observe_live_source=True
+    ) as snapshot:
         if snapshot.key!=expected_source_key:fail('CURRENT_WORKSPACE_SOURCE_MISMATCH')
         from standalone_build_outputs import (PROFILE, validate_spec, require_absent, capture_receipt, receipt_current)
         typed_output = bool(snapshot.input_policy and snapshot.input_policy.generated_output_profile)
@@ -190,7 +197,7 @@ def verify_current_workspace(project_dir, *, expected_source_key, dependency_pla
             remaining();validate_source_snapshot(snapshot,timeout_seconds=remaining())
             if (not source_snapshot_live_source_continuity(snapshot,timeout_seconds=remaining())
                     or (project/'package-lock.json').read_bytes()!=lock
-                    or tools!={'nodeSha256':_sha(Path(node).read_bytes()),'npmCliSha256':_sha(npm.read_bytes())}):
+                    or tools!={'nodeSha256':_sha_file(node),'npmCliSha256':_sha_file(npm)}):
                 fail('CURRENT_WORKSPACE_INPUT_CHANGED')
         source_guard()
         installation={'status':'EXISTING_TREE_REQUIRES_PHYSICAL_OBSERVATION','scriptsEnabled':False}

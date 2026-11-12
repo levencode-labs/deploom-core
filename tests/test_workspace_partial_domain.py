@@ -61,6 +61,39 @@ class PartialDomainTests(unittest.TestCase):
                                             ((self.key,), (self.provider,)))
         self.assertEqual(result["status"], "UNKNOWN")
 
+    def test_complete_domains_choose_one_version_for_an_observed_shared_slot(self):
+        other = ("packages/app", "dependencies", "plugin")
+        choices = (WorkspaceCandidate("2.1.0", {}), WorkspaceCandidate("2.0.0", {}))
+        domain = WorkspaceDomain("1.0.0", choices, mutable=True)
+        domains = {self.key: domain, other: domain}
+        latest = {declaration_id(key): "2.1.0" for key in domains}
+        plan = plan_workspace_from_lock(self.packages, domains, include_constraint_evidence=True)
+        self.assertEqual(plan["status"], "SAT_IN_MODELED_DOMAIN")
+        self.assertEqual(plan["assignment"], latest)
+        self.assertEqual(plan["topology"], "OBSERVED_LOCK_LAYOUT")
+        self.assertEqual(plan["verification"], "NOT_VERIFIED")
+        self.assertTrue(any(rule["provenance"] == "workspace-observed-instance"
+                            for rule in plan["constraintEvidence"]["rules"]))
+        retry = plan_workspace_from_lock(self.packages, domains, excluded_assignments=(latest,))
+        self.assertEqual(retry["assignment"], {declaration_id(key): "2.0.0" for key in domains})
+
+    def test_peer_of_shared_slot_constrains_both_declarations(self):
+        other = ("packages/app", "dependencies", "engine")
+        providers = WorkspaceDomain("1.0.0", (
+            WorkspaceCandidate("2.1.0", {}), WorkspaceCandidate("2.0.0", {}),
+        ), mutable=True)
+        domains = {
+            self.key: WorkspaceDomain("1.0.0", (WorkspaceCandidate("1.0.0", {"engine": "~2.0"}),)),
+            self.provider: providers,
+            other: providers,
+        }
+        packages = {**self.packages, "node_modules/engine": {"version": "1.0.0"}}
+        plan = plan_workspace_from_lock(packages, domains)
+        self.assertEqual(plan["status"], "SAT_IN_MODELED_DOMAIN")
+        self.assertEqual(plan["domain"]["evidenceCoverage"], "COMPLETE")
+        self.assertEqual(plan["assignment"][declaration_id(self.provider)], "2.0.0")
+        self.assertEqual(plan["assignment"][declaration_id(other)], "2.0.0")
+
     def test_unknown_shared_mutable_slot_does_not_become_singleton(self):
         other = ("packages/app", "dependencies", "plugin")
         result = plan_workspace_from_lock(self.packages, {self.key: self.domain, other: self.domain})
