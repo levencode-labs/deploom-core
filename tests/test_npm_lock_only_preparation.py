@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -78,7 +79,11 @@ class NpmLockOnlyPreparationTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 0, "")
             else:
                 steps.append("lock-only" if "--package-lock-only" in args else "physical-resolver")
-            return install(argv, cwd, **kwargs)
+            result = install(argv, cwd, **kwargs)
+            # Supply closure evidence to test publication order independently
+            # of the runner's ability to create an owned process namespace.
+            result.supervision = SimpleNamespace(quality="guaranteed-tree", descendants_remaining=0)
+            return result
 
         def observe_publish(store, proof_type, *args, **kwargs):
             steps.append(f"publish-{proof_type}")

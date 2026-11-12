@@ -151,7 +151,7 @@ class DependencyTreeGuardTests(unittest.TestCase):
 
     def test_esbuild_loader_and_windows_binary_are_private(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
+            root = Path(folder).resolve(strict=True)
             lower = root / "lower"
             clone = root / "clone"
             for name in ("esbuild/lib/main.js", "@esbuild/win32-x64/esbuild.exe", "unrelated/index.js"):
