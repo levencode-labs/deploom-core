@@ -2447,12 +2447,10 @@ class LiveDataClient:
         # Optional durable planning packument cache (C2): metadata read here is
         # merged across CLI invocations. Planning-only -- install, verification
         # and the vulnerability audit inventory never consult this cache.
-        self.metadata_cache_dir: Optional[Path] = (
-            Path(metadata_cache_dir) if metadata_cache_dir and allow_registry_metadata_redirects else None
-        )
+        self.metadata_cache_dir: Optional[Path] = Path(metadata_cache_dir) if metadata_cache_dir else None
         self.metadata_cache_ttl: float = float(metadata_cache_ttl or 0.0)
         self.metadata_cache_tool_version: str = metadata_cache_tool_version or ""
-        self._metadata_request_context = request_context(self.session, self.registry, self.metadata_cache_tool_version)[0]
+        self._metadata_request_context = self.metadata_request_context()[0]
         self._metadata_cache_disk_hits = 0
         self._metadata_cache_disk_misses = 0
         # Optional run deadline (Draft). When set, every request is bounded by
@@ -2487,6 +2485,10 @@ class LiveDataClient:
         the honest OSV-unavailable behavior are preserved.
         """
         return bool(getattr(self, "draft", False))
+
+    def metadata_request_context(self) -> tuple[str | None, bool]:
+        return request_context(self.session, self.registry, self.metadata_cache_tool_version,
+                               allow_redirects=self.allow_registry_metadata_redirects)
 
     def metadata_cache_stats(self) -> Tuple[int, int]:
         """(disk hits, disk misses) of the durable planning packument cache."""
@@ -3018,43 +3020,23 @@ class LiveDataClient:
     def _fetch_npm_metadata_result(self, pkg: str):
         """Return the packument and whether it is reusable by an independent client."""
         from planning_cache import planning_lease
-        context, durable = request_context(self.session, self.registry, self.metadata_cache_tool_version)
-        if not durable or self.metadata_cache_dir is None or self.metadata_cache_ttl <= 0:
+
+        context, durable = self.metadata_request_context()
+        if (not durable or self.metadata_cache_dir is None or self.metadata_cache_ttl <= 0
+                or (context == self._metadata_request_context and pkg in self.npm_cache)):
             return self._fetch_npm_metadata_live(pkg)
+
         def check():
             if self.deadline is not None:
                 self.deadline.check("metadata-cache-wait")
-        from planning_cache import cached_query
-        def fetch():
-            with planning_lease(["packument", str(self.metadata_cache_dir.resolve()), self.registry, context, pkg],
-                                check=check, timeout=self.timeout):
-                data, reusable = self._fetch_npm_metadata_live(pkg)
-                reason = "stateful" if not reusable else "" if isinstance(data, dict) else "unavailable"
-                return data, 1, reason, "registry-http"
-        if context != self._metadata_request_context:
-            self.npm_cache.clear()
-            self._metadata_request_context = context
-        if pkg in self.npm_cache:
-            if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
-                return self.npm_cache[pkg], True
-            self.npm_cache.pop(pkg, None)
-        data, executed, reason, _ = cached_query(["public-packument-v3", self.registry, context, pkg], fetch,
-                                                ttl=self.metadata_cache_ttl, check=check)
-        reusable = reason != "stateful"
-        if data is None:  # legitimate registry HTTP 404 package absence
-            if reusable:
-                self.npm_cache[pkg] = None
-            return None, reusable
-        if not valid_registry_packument_shape(data):
-            raise RegistryInfrastructureError("REGISTRY_METADATA_INVALID_SHAPE: cached metadata lacks valid versions/dist")
-        if not executed and isinstance(data, dict):
-            self._metadata_cache_disk_hits += 1
-        if reusable:
-            self.npm_cache[pkg] = data
-        return data, reusable
+
+        # Keep one fetch timestamp and validator set in the configured state directory.
+        with planning_lease(["packument", str(self.metadata_cache_dir.resolve()), self.registry, context, pkg],
+                            check=check, timeout=self.timeout):
+            return self._fetch_npm_metadata_live(pkg)
 
     def _fetch_npm_metadata_live(self, pkg: str):
-        context, durable = request_context(self.session, self.registry, self.metadata_cache_tool_version)
+        context, durable = self.metadata_request_context()
         if context is None or context != self._metadata_request_context:
             self.npm_cache.clear()
             self._metadata_request_context = context
@@ -3093,14 +3075,14 @@ class LiveDataClient:
                                                      **({} if self.allow_registry_metadata_redirects else {"allow_redirects": False}))
                 )
                 hops = (*getattr(response, "history", ()), response)
-                reusable = (durable and request_context(self.session, self.registry, self.metadata_cache_tool_version)
-                            == (context, True) and not any(
-                                key.lower() == "set-cookie" or (
-                                    key.lower() == "cache-control" and any(
-                                        directive.strip().partition("=")[0].strip().lower() == "no-store"
-                                        for directive in value.split(",")
-                                    )
-                                )
+                reusable = (durable and self.metadata_request_context() == (context, True)
+                            and not any(
+                                key.lower() == "set-cookie"
+                                or (key.lower() == "vary" and any(token.strip() == "*" for token in value.split(",")))
+                                or (key.lower() == "cache-control" and any(
+                                    directive.strip().partition("=")[0].strip().lower() in {"private", "no-store", "no-cache"}
+                                    for directive in value.split(",")
+                                ))
                                 for hop in hops for key, value in getattr(hop, "headers", {}).items()
                             ))
                 status = int(getattr(response, "status_code", 0) or 0)
@@ -4785,7 +4767,7 @@ def _prefetch_draft_registry_window(
     client: LiveDataClient, dependencies: Sequence[Tuple[str, str, str]],
 ) -> Dict[str, RegistryInfrastructureError]:
     """Warm one window without holding already published rows for later fetches."""
-    context, independently_fetchable = request_context(client.session, client.registry, client.metadata_cache_tool_version)
+    context, independently_fetchable = client.metadata_request_context()
     if context is None or not independently_fetchable:
         return {}
     if context != client._metadata_request_context:
@@ -4852,7 +4834,7 @@ def _prefetch_registry_metadata(
         return
     context, durable = None, False
     if isinstance(client, LiveDataClient):
-        context, durable = request_context(client.session, client.registry, client.metadata_cache_tool_version)
+        context, durable = client.metadata_request_context()
         if context is None or context != client._metadata_request_context:
             client.npm_cache.clear()
             client._metadata_request_context = context

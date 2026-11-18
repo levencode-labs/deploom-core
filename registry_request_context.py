@@ -6,11 +6,11 @@ from urllib.parse import urlsplit
 import requests
 
 
-def request_context(session, url: str, tool_version: str = "") -> tuple[str | None, bool]:
+def request_context(session, url: str, tool_version: str = "", *, allow_redirects: bool = True) -> tuple[str | None, bool]:
     # Arbitrary auth hooks may sign/mutate a request. Do not invoke them merely
     # to key a cache, or reuse metadata obtained under their previous state.
     auth = getattr(session, "auth", None)
-    if (auth is not None and not isinstance(auth, tuple)) or getattr(session, "cert", None) or isinstance(getattr(session, "verify", True), str) or any(getattr(session, "hooks", {}).values()):
+    if (auth is not None and not isinstance(auth, tuple)) or getattr(session, "cert", None) or getattr(session, "verify", True) is not True or any(getattr(session, "hooks", {}).values()):
         return None, False
     if not isinstance(session, requests.Session) or any(type(adapter) is not requests.adapters.HTTPAdapter for adapter in session.adapters.values()):
         return None, False
@@ -21,10 +21,10 @@ def request_context(session, url: str, tool_version: str = "") -> tuple[str | No
         parts = urlsplit(url)
         cookies = [(c.domain, c.path, c.name, c.value, c.secure, c.expires) for c in session.cookies]
         payload = {"url": prepared.url, "headers": headers, "cookies": cookies, "transport": settings, "redirects": session.max_redirects, "tool": tool_version}
-        # Pre-guard entries may have been populated by a stateful response.
-        payload["cachePolicy"] = "public-response-v3"
+        # Earlier entries may have followed redirects or come from a private response.
+        payload["cachePolicy"] = "public-response-v4"
+        payload["allowRedirects"] = allow_redirects
         key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        private_proxy = any(urlsplit(str(value)).username for value in settings.get("proxies", {}).values() if value)
     except Exception:
         # A cache-key failure must never become a registry/network failure.
         return None, False
@@ -32,5 +32,5 @@ def request_context(session, url: str, tool_version: str = "") -> tuple[str | No
     # in-memory dedup, but never persist or consume cross-process metadata.
     durable = not (headers.get("authorization") or cookies or headers.get("cookie")
                    or parts.username or parts.password or session.trust_env or session.params
-                   or private_proxy or set(headers) - {key.lower() for key in requests.utils.default_headers()})
+                   or settings.get("proxies") or set(headers) - {key.lower() for key in requests.utils.default_headers()})
     return key, durable

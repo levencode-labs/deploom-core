@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import http.server
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 import dependency_live_roadmap_generator as roadmap
 
@@ -72,7 +74,7 @@ def _stop_server(server, thread):
     thread.join(timeout=2.0)
 
 
-def _client(registry, cache_dir, ttl=600.0, tool="test-tool"):
+def _client(registry, cache_dir, ttl=600.0, tool="test-tool", *, redirects=True):
     return roadmap.LiveDataClient(
         registry,
         timeout=10,
@@ -82,6 +84,7 @@ def _client(registry, cache_dir, ttl=600.0, tool="test-tool"):
         metadata_cache_dir=cache_dir,
         metadata_cache_ttl=ttl,
         metadata_cache_tool_version=tool,
+        allow_registry_metadata_redirects=redirects,
     )
 
 
@@ -186,6 +189,117 @@ class RegistryMetadataCacheClientTests(unittest.TestCase):
             self.assertEqual(second.fetch_npm_metadata("pkg-a"), PACKUMENT)
             self.assertEqual(counts["hits"], 1, "a warm planning cache must serve the second invocation without a network fetch")
             self.assertEqual(second.metadata_cache_stats(), (1, 0))
+
+
+    def test_no_redirect_mode_uses_one_cache_and_revalidates_expired_entries(self):
+        visits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                validator = self.headers.get("If-None-Match")
+                visits.append((self.path, validator))
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/pkg-a")
+                    self.end_headers()
+                    return
+                if validator == '"fixture"' or self.path == "/unbound":
+                    self.send_response(304)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("ETag", '"fixture"')
+                self.end_headers()
+                self.wfile.write(json.dumps(PACKUMENT).encode())
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(_stop_server, server, thread)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cache_dir = root / "cache"
+            other_query_cache = root / "query-cache"
+            registry = _registry_url(server)
+            with patch.dict(os.environ, {"DEPLOOM_PLANNING_CACHE_DIR": str(other_query_cache)}):
+                self.assertEqual(_client(registry, cache_dir).fetch_npm_metadata("redirect"), PACKUMENT)
+                with self.assertRaises(roadmap.RegistryInfrastructureError):
+                    _client(registry, cache_dir, redirects=False).fetch_npm_metadata("redirect")
+                self.assertEqual(visits, [("/redirect", None), ("/pkg-a", None), ("/redirect", None)])
+
+                with self.assertRaises(roadmap.RegistryInfrastructureError):
+                    _client(registry, cache_dir, redirects=False).fetch_npm_metadata("unbound")
+                self.assertEqual(_client(registry, cache_dir, redirects=False).fetch_npm_metadata("pkg-a"), PACKUMENT)
+                warm = _client(registry, cache_dir, redirects=False)
+                self.assertEqual(warm.fetch_npm_metadata("pkg-a"), PACKUMENT)
+                self.assertEqual(warm.metadata_cache_stats(), (1, 0))
+                self.assertEqual(visits[-2:], [("/unbound", None), ("/pkg-a", None)])
+                entries = list(cache_dir.rglob("*.json"))
+                for entry_path in entries:
+                    entry = json.loads(entry_path.read_text(encoding="utf-8"))
+                    if entry["name"] == "pkg-a":
+                        entry["fetchedAtUnix"] -= 1000
+                        entry_path.write_text(json.dumps(entry), encoding="utf-8")
+                self.assertEqual(_client(registry, cache_dir, redirects=False).fetch_npm_metadata("pkg-a"), PACKUMENT)
+                self.assertEqual(visits[-1], ("/pkg-a", '"fixture"'))
+                self.assertEqual(len(entries), 2)
+                self.assertFalse(other_query_cache.exists())
+
+    def test_private_or_stateful_responses_do_not_persist_in_no_redirect_mode(self):
+        cases = {
+            "private": ("Cache-Control", 'max-age=900, Private="X-User"'),
+            "no-store": ("Cache-Control", "no-store"),
+            "no-cache": ("Cache-Control", "no-cache"),
+            "cookie": ("Set-Cookie", "view=private; Path=/"),
+            "vary": ("Vary", " * "),
+        }
+        requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                name = self.path.lstrip("/")
+                requests.append(name)
+                self.send_response(200)
+                self.send_header(*cases[name])
+                self.end_headers()
+                self.wfile.write(json.dumps(PACKUMENT).encode())
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(_stop_server, server, thread)
+        with tempfile.TemporaryDirectory() as raw:
+            cache = Path(raw)
+            registry = _registry_url(server)
+            for name in cases:
+                for _ in range(2):
+                    with self.subTest(name=name):
+                        self.assertEqual(_client(registry, cache, redirects=False).fetch_npm_metadata(name), PACKUMENT)
+            self.assertCountEqual(requests, [name for name in cases for _ in range(2)])
+            self.assertEqual(list(cache.rglob("*.json")), [])
+
+    def test_no_redirect_context_bypasses_durable_cache_for_credential_or_proxy_views(self):
+        registry = "https://registry.example.invalid"
+        client = _client(registry, Path("not-used"), redirects=False)
+        self.addCleanup(client.session.close)
+        self.assertTrue(client.metadata_request_context()[1])
+        for setup in (
+            lambda session: session.headers.update(Authorization="Bearer synthetic"),
+            lambda session: session.cookies.set("fixture", "synthetic"),
+            lambda session: session.proxies.update(https="http://proxy.example.invalid"),
+            lambda session: setattr(session, "trust_env", True),
+            lambda session: setattr(session, "verify", False),
+        ):
+            other = _client(registry, Path("not-used"), redirects=False)
+            self.addCleanup(other.session.close)
+            setup(other.session)
+            self.assertFalse(other.metadata_request_context()[1])
 
     def test_successful_fetch_with_unwritable_cache_is_still_success(self):
         # P1 (#2): an unusable cache directory must not degrade a successful

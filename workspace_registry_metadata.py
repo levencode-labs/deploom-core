@@ -1,8 +1,6 @@
 """Deadline-aware, request-local workspace metadata windows."""
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from registry_request_context import request_context
-
 
 def fetch_workspace_packuments(client, names):
     """Parallelize only independent public reads; never publish late cache writes.
@@ -18,7 +16,7 @@ def fetch_workspace_packuments(client, names):
         DraftBudgetExceeded, RegistryInfrastructureError, _registry_prefetch_client,
     )
     names = tuple(dict.fromkeys(names))
-    context = request_context(client.session, client.registry, client.metadata_cache_tool_version)
+    context = client.metadata_request_context()
     deadline = client.deadline
     if len(names) < 2 or context[0] is None or not context[1] or deadline is None:
         return {name: client.fetch_npm_metadata(name) for name in names}
@@ -55,7 +53,7 @@ def fetch_workspace_packuments(client, names):
                 except RegistryInfrastructureError as exc:
                     errors[name] = exc
             deadline.check('workspace-metadata')
-            if stateful or request_context(client.session, client.registry, client.metadata_cache_tool_version) != context:
+            if stateful or client.metadata_request_context() != context:
                 break
             if errors:
                 raise errors[sorted(errors)[0]]
