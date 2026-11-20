@@ -56,6 +56,7 @@ import io
 import itertools
 import json
 import os
+import sqlite3
 import re
 import subprocess
 import sys
@@ -183,6 +184,7 @@ from lockfile_consistency import (
     select_lockfile,
 )
 from semantic_version import NpmSpec, Version
+import osv_offline
 from block_v_predicate_search import prioritize_probe_preference
 from block_psi55_resolver_overrides import (
     propose_duplicate_type_override,
@@ -3203,6 +3205,13 @@ class LiveDataClient:
         versions: List[str],
         progress_label: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
+        offline = os.environ.get("DEPLOOM_DRAFT_OSV_DIR")
+        if offline:
+            try:
+                return osv_offline.query(offline, pkg, versions, os.environ.get("DEPLOOM_DRAFT_PRIVATE_SCOPES", ""),
+                                         os.environ.get("DEPLOOM_DRAFT_PUBLIC_NAMES", ""))
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                raise VulnerabilityEvidenceUnavailable(str(exc)) from exc
         if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
             approved_registry = os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE")
             if approved_registry:
@@ -5386,7 +5395,9 @@ def analyze_project(
                 notes.append(candidate_search_truncated_note)
         try:
             vulns = client.query_osv_versions(name, osv_candidates, progress_label=dependency_label)
-        except VulnerabilityEvidenceUnavailable:
+        except VulnerabilityEvidenceUnavailable as exc:
+            if os.environ.get("DEPLOOM_DRAFT_OSV_DIR"):
+                notes.append("Offline OSV: " + str(exc))
             if not tolerate_registry_failure:
                 raise
             vulns = None
@@ -5405,7 +5416,7 @@ def analyze_project(
             min_nv = "неизвестно"
             notes.append("OSV evidence недоступен: уязвимости неизвестны, safe target по уязвимостям не вычислялся")
         else:
-            current_summary = vuln_summary(vulns.get(current, []))
+            current_summary = vuln_summary(vulns[current]) if current in vulns else "unknown"
             min_nc = min_by_vuln(search_versions, vulns, "no-critical", target_available)
             min_nh = min_by_vuln(search_versions, vulns, "no-high", target_available)
             min_nv = min_by_vuln(search_versions, vulns, "no-vuln", target_available)
@@ -24507,7 +24518,15 @@ def enrich_final_registry_security(
             missing[row.name, version].append(row)
     if not missing:
         return
-    assessed = client._query_registry_security_pairs(sorted(missing), approved_registry)
+    if os.environ.get("DEPLOOM_DRAFT_OSV_DIR"):
+        assessed = {}
+        for pkg, version in missing:
+            try:
+                assessed[pkg, version] = client.query_osv_versions(pkg, [version])[version]
+            except VulnerabilityEvidenceUnavailable:
+                continue
+    else:
+        assessed = client._query_registry_security_pairs(sorted(missing), approved_registry)
     for pair, advisories in assessed.items():
         summary = vuln_summary(advisories)
         version = pair[1]
@@ -26583,6 +26602,9 @@ def publish_draft_result(
                 "fullDependencyTreeSecurityVerified": False}
                if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1"
                and os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE") else {}),
+            **({"securityEvidenceMode": "OFFLINE_OSV_NPM", "fullDependencyTreeSecurityVerified": False,
+                "securitySnapshot": osv_offline.snapshot(os.environ["DEPLOOM_DRAFT_OSV_DIR"])[1]}
+               if os.environ.get("DEPLOOM_DRAFT_OSV_DIR") else {}),
         },
         "objectiveEvidence": {
             "objective": contract["objective"],
@@ -27888,7 +27910,8 @@ def main() -> None:
             rows_by_project,
         )
         approved_registry = os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE")
-        if args.draft_baseline and approved_registry and os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
+        if args.draft_baseline and (os.environ.get("DEPLOOM_DRAFT_OSV_DIR") or
+                                    (approved_registry and os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1")):
             run_supervised_planning(
                 "final-registry-security",
                 deadline_clock,
