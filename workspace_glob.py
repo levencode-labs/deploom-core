@@ -48,41 +48,25 @@ def _expand_braces(pattern: str, out: List[str]) -> None:
         if pattern not in out:
             out.append(pattern)
         return
-    head, inner, tail = group
-    for alternative in inner.split(","):
+    head, alternatives, tail = group
+    for alternative in alternatives:
         _expand_braces(head + alternative + tail, out)
 
 
-def _first_brace_group(pattern: str) -> Optional[Tuple[str, str, str]]:
-    """Return ``(head, inner, tail)`` of the FIRST innermost ``{...}`` group.
-
-    ``None`` when the pattern has no well-formed brace group.
-    """
-    n = len(pattern)
-    i = 0
-    while i < n:
-        if pattern[i] != "{":
-            i += 1
-            continue
-        depth = 0
-        j = i
-        while j < n:
-            char = pattern[j]
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        if depth != 0:
-            return None  # unbalanced '{' -> treat as literal
-        inner = pattern[i + 1:j]
-        if "{" in inner:
-            nested = pattern.find("{", i + 1)
-            i = nested if nested != -1 else i + 1
-            continue
-        return pattern[:i], inner, pattern[j + 1:]
+def _first_brace_group(pattern: str) -> Optional[Tuple[str, List[str], str]]:
+    """Find an expandable group, retaining braces around literal names."""
+    stack: List[Tuple[int, List[int]]] = []
+    for index, char in enumerate(pattern):
+        if char == "{":
+            stack.append((index, []))
+        elif char == "," and stack:
+            stack[-1][1].append(index)
+        elif char == "}" and stack:
+            start, commas = stack.pop()
+            if commas:
+                bounds = [start, *commas, index]
+                parts = [pattern[left + 1:right] for left, right in zip(bounds, bounds[1:])]
+                return pattern[:start], parts, pattern[index + 1:]
     return None
 
 
@@ -100,10 +84,10 @@ def unsupported_workspace_pattern(pattern: str) -> str:
     for opener in ("?(", "*(", "+(", "@(", "!("):
         if opener in body:
             return f"extglob `{opener}...)` is not supported"
-    if "|" in body:
-        pair = _first_brace_group(body)
-        if pair is not None and "|" in pair[1]:
-            return "alternation `|` inside braces `{...}` is not supported"
+    if re.search(r"\{(?:-?\d+\.\.-?\d+|[a-zA-Z]\.\.[a-zA-Z])(?:\.\.-?\d+)?\}", body):
+        return "brace ranges are not supported"
+    if re.search(r"\{[^{}]*\|[^{}]*\}", body):
+        return "alternation inside braces is not supported"
     return ""
 
 

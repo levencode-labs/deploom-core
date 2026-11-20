@@ -30,6 +30,16 @@ class BraceExpansionTests(unittest.TestCase):
             expand_braces("{a,{b,c}}/d"),
         )
 
+    def test_literal_braces_survive_alternative_expansion(self) -> None:
+        self.assertEqual(["packages/{a}"], expand_braces("packages/{a}"))
+        self.assertEqual(["x", "{a}"], expand_braces("{x,{a}}"))
+        self.assertFalse(match_workspace_pattern("packages/a", "packages/{a}"))
+        self.assertTrue(match_workspace_pattern("packages/{a}", "packages/{a}"))
+
+    def test_ranges_report_unsupported(self) -> None:
+        for pattern in ("v{1..3}", "{a..z}", "{-2..2..2}"):
+            self.assertTrue(unsupported_workspace_pattern(pattern))
+
     def test_negative_prefix_survives_expansion(self) -> None:
         self.assertEqual(["!packages/lib"], expand_braces("!packages/lib"))
 

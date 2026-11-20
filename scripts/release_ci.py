@@ -80,7 +80,7 @@ def build_assets(tag):
     else:
         installed=ROOT/'.component-release'/'installed-core'
         run([sys.executable,'-m','pip','install','--no-deps','--no-index','--no-compile','--target',str(installed),str(wheel)])
-        body="import pathlib,sys,importlib.metadata;import dependency_live_roadmap_generator as m;assert pathlib.Path(m.__file__).is_relative_to(pathlib.Path(sys.argv[1]));assert importlib.metadata.version('deploom-core')==sys.argv[2];sys.argv=['deploom-core','--help'];m.main()"
+        body="import pathlib,sys,importlib.metadata;import dependency_live_roadmap_generator as m;assert pathlib.Path(m.__file__).is_relative_to(pathlib.Path(sys.argv[1]));assert importlib.metadata.version('deploom-core')==sys.argv[2];import migration_documents as docs;assert pathlib.Path(docs.__file__).is_relative_to(pathlib.Path(sys.argv[1]));docs.check_catalogs();sys.argv=['deploom-core','--help'];m.main()"
         run([sys.executable,'-c',body,str(installed),value['version']],cwd=ROOT.parent,env={**os.environ,'PYTHONPATH':str(installed)})
     extracted=ROOT/'.component-release'/'sdist-source';extracted.mkdir()
     with tarfile.open(sdist) as archive:

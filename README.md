@@ -71,4 +71,6 @@ Use the interpreter from your virtual environment if `python` resolves elsewhere
 | **[deploom-core](https://github.com/levencode-labs/deploom-core)** | Core decision and planning engine |
 | **[deploom-mcp](https://github.com/levencode-labs/deploom-mcp)** | MCP tools, Blueprint adapter, agent Skill, and authorized evidence workflows |
 
+DepLoom Core and its first-party schemas are licensed under the [Apache License 2.0](LICENSE).
+
 Download Core and the matching checksums from [GitHub Releases](https://github.com/levencode-labs/deploom-core/releases/latest). Run project acceptance on the final dependency tree.
