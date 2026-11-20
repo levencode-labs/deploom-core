@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deploom-core"
-version = "0.1.13"
+version = "0.1.14"
 description = "Headless, planning-only dependency decision engine for DepLoom"
 readme = "README.md"
 license = "Apache-2.0"
