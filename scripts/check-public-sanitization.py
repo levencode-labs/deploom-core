@@ -52,6 +52,10 @@ FORBIDDEN_NAMES = {'.npmrc', '.netrc', '.yarnrc', 'id_rsa', 'id_ed25519'}
 FORBIDDEN_SUFFIX = {'.pem', '.key', '.p12', '.pfx', '.jks', '.keystore'}
 TOKEN_RE = re.compile(r'@[A-Za-z0-9._-]+/|[A-Za-z0-9_@.-]+(?:/[A-Za-z0-9_@.-]+)*')
 PRIVATE_IP_RE = re.compile(r'\b(?:10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.(?:\d{1,3}\.)\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3})\b')
+# Complete public advisory IDs occur in OSV data and regression fixtures.
+PUBLIC_ADVISORY_RE = re.compile(
+    r'\b(?:CVE-\d{4}-\d{4,}|MAL-\d{4}-\d+|GHSA-[23456789cfghjmpqrvwx]{4}(?:-[23456789cfghjmpqrvwx]{4}){2})\b'
+)
 TICKET_RE = re.compile(r'\b[A-Z]{2,5}-\d{4,}\b')
 
 
@@ -130,7 +134,7 @@ def main() -> int:
         private_ip = PRIVATE_IP_RE.search(text)
         if private_ip:
             errors.append(f'private-network-address: {rel}: {private_ip.group(0)}')
-        ticket = TICKET_RE.search(text)
+        ticket = TICKET_RE.search(PUBLIC_ADVISORY_RE.sub(" ", text))
         if ticket:
             errors.append(f'private-looking-ticket-id: {rel}: {ticket.group(0)}')
         for candidate in candidate_identifiers(text):
