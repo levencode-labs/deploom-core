@@ -175,7 +175,7 @@ def parse_yarn_lock(path: Path) -> Dict[str, str]:
     return mapping
 
 
-def parse_yarn_lock_entries(path: Path) -> List[Dict[str, Any]]:
+def parse_yarn_lock_entries(path: Path, *, include_artifact: bool = False) -> List[Dict[str, Any]]:
     """Parse the subset of Yarn Classic lock syntax needed for graph reachability.
 
     ``yarn.lock`` already contains the exact versions and dependency requests
@@ -219,13 +219,14 @@ def parse_yarn_lock_entries(path: Path) -> List[Dict[str, Any]]:
             if stripped in {"dependencies:", "optionalDependencies:"}:
                 dependency_block = stripped[:-1]
                 continue
-            if stripped.startswith("version "):
+            if stripped.startswith("version ") or (include_artifact and stripped.startswith(("resolved ", "integrity "))):
                 try:
                     parts = shlex.split(stripped)
                 except ValueError:
                     parts = stripped.split(maxsplit=1)
                 if len(parts) >= 2:
-                    current["version"] = parts[1]
+                    field = parts[0]
+                    current[field] = parts[1] if field == "version" or field not in current else ""
                 continue
         if dependency_block and raw_line.startswith("    "):
             try:

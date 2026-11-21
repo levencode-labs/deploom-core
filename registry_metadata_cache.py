@@ -53,6 +53,10 @@ _WINDOWS_PERMISSION_GRACE_SECONDS = 0.25
 _WINDOWS_PERMISSION_MAX_RETRIES = 4
 
 
+class DirectRegistryPackument(dict):
+    """Metadata from an anonymous direct response to the requested package URL."""
+
+
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -116,6 +120,8 @@ def load_packument(
     current = time.time() if now is None else float(now)
     if not _entry_is_fresh(entry, registry, name, ttl_seconds, current, context):
         return None
+    if entry.get("directAnonymousOrigin") is True:
+        return DirectRegistryPackument(entry["data"])
     return entry["data"]
 
 
@@ -183,6 +189,7 @@ def store_packument(
         "validators": {key: str(value)[:1024] for key, value in (validators or {}).items()
                        if key in {"ETag", "Last-Modified"} and "\r" not in str(value) and "\n" not in str(value)},
     }
+    entry["directAnonymousOrigin"] = isinstance(data, DirectRegistryPackument)
     payload = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     with _CACHE_WRITE_THREAD_LOCK:
         for attempt in range(_WINDOWS_PERMISSION_MAX_RETRIES):

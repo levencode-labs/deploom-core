@@ -369,6 +369,41 @@ def yarn_selector_candidates(name: str, spec: str) -> List[str]:
     ]
 
 
+def direct_public_lock_records(project, lock, declarations):
+    """Index only direct selectors for comparison to anonymous npm packuments."""
+    try:
+        if lock.name == "yarn.lock":
+            from manual_dependency_audit import parse_yarn_lock_entries
+            by_selector = {}
+            for entry in parse_yarn_lock_entries(lock, include_artifact=True):
+                for selector in entry["selectors"]:
+                    by_selector[selector] = None if selector in by_selector else entry
+            result = {}
+            for name, _, spec in declarations:
+                matches = [by_selector[key] for key in yarn_selector_candidates(name, spec) if key in by_selector]
+                if len(matches) == 1:
+                    result[name, spec] = matches[0]
+            return result
+        if lock.name not in {"package-lock.json", "npm-shrinkwrap.json"}:
+            return {}
+        from resolution_inventory import npm_lock_resolution_slots
+        data = json.loads(lock.read_bytes())
+        relative = project.resolve().relative_to(lock.parent.resolve()).as_posix()
+        packages, legacy = data.get("packages"), data.get("dependencies")
+        result = {}
+        for name, _, spec in declarations:
+            if isinstance(packages, dict):
+                for slot in npm_lock_resolution_slots(name, "" if relative == "." else relative):
+                    if slot in packages:
+                        result[name, spec] = packages[slot]
+                        break
+            elif relative == "." and isinstance(legacy, dict):
+                result[name, spec] = legacy.get(name)
+        return result
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError, KeyError):
+        return {}
+
+
 def semver_satisfies(version: str, spec: str) -> bool:
     try:
         normalized = version[1:] if version.startswith("v") else version

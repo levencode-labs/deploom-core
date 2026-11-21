@@ -158,8 +158,10 @@ from constraint_cache import (
 )
 from copy import copy as shallow_copy
 from registry_request_context import request_context
+from public_npm_identity import PUBLIC_NPM_REGISTRY, matches_lock, published_version
 from registry_metadata_cache import (
     DEFAULT_METADATA_CACHE_TTL_SECONDS,
+    DirectRegistryPackument,
     load_packument,
     load_revalidation_entry,
     store_packument,
@@ -176,6 +178,7 @@ from dependency_compatibility_evidence import (
     load_compatibility_evidence, localize_compatibility_evidence,
 )
 from lockfile_consistency import (
+    direct_public_lock_records,
     LockfileConsistencyError,
     ensure_lockfile_consistency,
     exact_package_lock_version,
@@ -244,7 +247,7 @@ from verification_experiment_registry import (
 
 # BLOCK_Y_FULL_OBSERVABILITY_V1
 
-NPM_REGISTRY = "https://registry.npmjs.org"
+NPM_REGISTRY = PUBLIC_NPM_REGISTRY
 OSV_QUERY_BATCH = os.environ.get("DEPLOOM_OSV_QUERY_BATCH") or "https://api.osv.dev/v1/querybatch"
 OSV_VULN = os.environ.get("DEPLOOM_OSV_VULN") or "https://api.osv.dev/v1/vulns/{id}"
 
@@ -3093,6 +3096,10 @@ class LiveDataClient:
         encoded = pkg.replace("/", "%2F")
         url = f"{self.registry}/{encoded}"
         stale = load_revalidation_entry(self.metadata_cache_dir, self.registry, pkg, context=context or "") if durable and self.metadata_cache_ttl > 0 else None
+        if self.registry == PUBLIC_NPM_REGISTRY and stale and "directAnonymousOrigin" not in stale:
+            # On normal expiry request the bytes once. A legacy entry carries
+            # no record of whether the old request was redirected.
+            stale = None
         conditional = {}
         if stale:
             for header, request_header in (("ETag", "If-None-Match"), ("Last-Modified", "If-Modified-Since")):
@@ -3119,12 +3126,23 @@ class LiveDataClient:
                                 for hop in hops for key, value in getattr(hop, "headers", {}).items()
                             ))
                 status = int(getattr(response, "status_code", 0) or 0)
+                prepared = getattr(response, "request", None)
+                sent_headers = getattr(prepared, "headers", None)
+                direct_public = (reusable and self.registry == PUBLIC_NPM_REGISTRY
+                                 and getattr(response, "history", None) == [] and getattr(response, "url", None) == url
+                                 and getattr(prepared, "method", None) == "GET" and getattr(prepared, "url", None) == url
+                                 and isinstance(sent_headers, Mapping)
+                                 and not any(key.lower() in {"authorization", "proxy-authorization", "cookie"}
+                                             for key in sent_headers))
                 if status == 304 and stale is not None:
                     response.close()
                     data = stale["data"]
                     if not valid_registry_packument_shape(data):
                         raise ValueError("304 response has invalid cached registry packument")
                     if reusable:
+                        # A 304 cannot establish the provenance of previously unmarked bytes.
+                        if direct_public and stale.get("directAnonymousOrigin") is True:
+                            data = DirectRegistryPackument(data)
                         store_packument(self.metadata_cache_dir, self.registry, pkg, data,
                                         self.metadata_cache_tool_version, context=context or "", validators=stale["validators"])
                         self.npm_cache[pkg] = data
@@ -3148,6 +3166,8 @@ class LiveDataClient:
                 data = self._bounded_json(response)
                 if not valid_registry_packument_shape(data):
                     raise ValueError("registry packument has invalid versions/dist-tags/time/dist shape")
+                if direct_public and status == 200 and data.get("name") == pkg:
+                    data = DirectRegistryPackument(data)
                 if not durable or reusable:
                     self.npm_cache[pkg] = data
                 if reusable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
@@ -3243,10 +3263,22 @@ class LiveDataClient:
             raise VulnerabilityEvidenceUnavailable("REGISTRY_ADVISORY_EVIDENCE_UNAVAILABLE")
         return {version: assessed[pkg, version] for version in versions}
 
-    def _query_offline_versions(self, offline, pkg, versions, diagnostics):
+    def _query_offline_versions(self, offline, pkg, versions, diagnostics, excluded_public_version=None):
         assessments = osv_offline.assess(offline, pkg, versions,
                                          os.environ.get("DEPLOOM_DRAFT_PRIVATE_SCOPES", ""),
                                          os.environ.get("DEPLOOM_DRAFT_PUBLIC_NAMES", ""))
+        meta = self.npm_cache.get(pkg)
+        public_versions = set()
+        if (isinstance(meta, DirectRegistryPackument) and self.registry == PUBLIC_NPM_REGISTRY
+                and self.metadata_request_context() == (self._metadata_request_context, True)):
+            for version, assessment in assessments.items():
+                if (assessment.reason == "PUBLIC_PACKAGE_UNCONFIRMED"
+                        and osv_offline.is_exact_version(version) and published_version(meta, pkg, version) is not None):
+                    if version == excluded_public_version:
+                        assessment.reason = "LOCKED_PUBLIC_ARTIFACT_UNCONFIRMED"
+                        continue
+                    assessments[version] = osv_offline.PairAssessment()
+                    public_versions.add(version)
         missing = [(pkg, version) for version, item in assessments.items()
                    if item.reason and osv_offline.is_exact_version(version)]
         fallback = {}
@@ -3256,6 +3288,8 @@ class LiveDataClient:
         for version, assessment in assessments.items():
             source = "OFFLINE_OSV_NPM"
             evidence = {}
+            if version in public_versions:
+                evidence["publicIdentitySource"] = "NPM_PUBLIC_PACKUMENT"
             if assessment.reason:
                 evidence["osvReason"] = assessment.reason
             record = fallback.get((pkg, version))
@@ -3285,10 +3319,12 @@ class LiveDataClient:
         progress_label: str = "",
         *,
         diagnostics: Optional[Dict[str, Dict[str, Any]]] = None,
+        excluded_public_version: Optional[str] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         offline = os.environ.get("DEPLOOM_DRAFT_OSV_DIR")
         if offline:
-            return self._query_offline_versions(offline, pkg, versions, diagnostics if diagnostics is not None else {})
+            return self._query_offline_versions(offline, pkg, versions, diagnostics if diagnostics is not None else {},
+                                                excluded_public_version)
         if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
             approved_registry = os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE")
             if approved_registry:
@@ -5169,6 +5205,7 @@ def analyze_project(
         return []
     selected_lock = str(project.lockfile_state.get("lockfile") or "")
     lock = Path(selected_lock) if selected_lock else None
+    public_lock_records = None
     pkg_json = read_json(pkg_path)
     profile = build_project_profile(project, pkg_json)
     rows: List[DependencyRow] = []
@@ -5487,13 +5524,22 @@ def analyze_project(
                 notes.append(candidate_search_truncated_note)
         diagnostics = {}
         offline_query = isinstance(client, LiveDataClient) and os.environ.get("DEPLOOM_DRAFT_OSV_DIR")
+        excluded_public_version = None
+        if offline_query and lock and isinstance(meta, DirectRegistryPackument):
+            if public_lock_records is None:
+                public_lock_records = direct_public_lock_records(project.path, lock, dependencies)
+            if not matches_lock(meta, name, current, public_lock_records.get((name, spec)),
+                                yarn=lock.name == "yarn.lock"):
+                excluded_public_version = current
         if offline_query and _unresolved_current_range(current_source, spec, current):
             # A range lower bound is a planning hint; it does not identify the installed package.
             diagnostics[current] = {"status": "UNKNOWN", "reason": "CURRENT_VERSION_UNRESOLVED"}
             osv_candidates = [version for version in osv_candidates if version != current]
         try:
             vulns = client.query_osv_versions(name, osv_candidates, progress_label=dependency_label,
-                                             **({"diagnostics": diagnostics} if offline_query else {}))
+                                             **({"diagnostics": diagnostics} if offline_query else {}),
+                                             **({"excluded_public_version": excluded_public_version}
+                                                if excluded_public_version is not None else {}))
         except VulnerabilityEvidenceUnavailable as exc:
             if os.environ.get("DEPLOOM_DRAFT_OSV_DIR"):
                 notes.append("Offline OSV: " + str(exc))
