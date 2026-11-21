@@ -184,7 +184,7 @@ from lockfile_consistency import (
 )
 from semantic_version import NpmSpec, Version
 import osv_offline
-from registry_advisory_evidence import corporate_advisory_source_matches
+from registry_advisory_evidence import corporate_advisory_source_matches, corporate_registry_matches
 from block_v_predicate_search import prioritize_probe_preference
 from block_psi55_resolver_overrides import (
     propose_duplicate_type_override,
@@ -2409,6 +2409,10 @@ def _draft_progress(client: Any, **kwargs: Any) -> None:
             pass
 
 
+def _private_package(name):
+    return osv_offline.private_package(name, os.environ.get("DEPLOOM_DRAFT_PRIVATE_SCOPES", ""))
+
+
 def _corporate_advisory_fallback(registry):
     return (os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1"
             and corporate_advisory_source_matches(
@@ -2436,7 +2440,8 @@ class LiveDataClient:
         self.sleep_sec = sleep_sec
         self.use_system_proxy = use_system_proxy
         self.session = requests.Session()
-        self.allow_registry_metadata_redirects = allow_registry_metadata_redirects
+        self.allow_registry_metadata_redirects = allow_registry_metadata_redirects and not (
+            os.environ.get("DEPLOOM_DRAFT_PRIVATE_SCOPES") and os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1")
         # Important for Windows/corporate setups: requests inherits proxy
         # settings from environment variables and WinINet/registry through
         # urllib.getproxies() when trust_env=True. That can make the tool try
@@ -2749,6 +2754,8 @@ class LiveDataClient:
         actual GET.  Redirects are accepted only when the final URL remains
         inside the configured registry path.
         """
+        if self._private_metadata_blocked(pkg):
+            return {"package": pkg, "version": version, "status": "unknown", "error": "PRIVATE_METADATA_REGISTRY_UNAPPROVED"}
         key = (pkg, version)
         if key in self.registry_artifact_cache:
             return dict(self.registry_artifact_cache[key])
@@ -2917,6 +2924,8 @@ class LiveDataClient:
             or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version)
         ):
             return None, "INVALID_EXACT_VERSION_INPUT"
+        if self._private_metadata_blocked(pkg):
+            return None, "PRIVATE_METADATA_REGISTRY_UNAPPROVED"
         url = f"{self.registry}/{quote(pkg, safe='@')}/{quote(version, safe='')}"
         response = None
         try:
@@ -2988,7 +2997,7 @@ class LiveDataClient:
         url = str(evidence.get("finalUrl") or evidence.get("tarballUrl") or "")
         if not self.registry_artifact_url_allowed(url):
             return None
-        return self.fetch_bytes(url)
+        return self.fetch_bytes(url, allow_redirects=False) if _private_package(pkg) else self.fetch_bytes(url)
 
     def registry_version_type_declarations_ok(self, pkg: str, meta: Dict[str, Any], version: str) -> Optional[str]:
         """Return a blocker when promised declarations are absent from tarball."""
@@ -3030,6 +3039,12 @@ class LiveDataClient:
         self.registry_self_types_cache[key] = value
         return value
 
+    def _private_metadata_blocked(self, pkg: str) -> bool:
+        return (_private_package(pkg)
+                and not (os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1"
+                         and not self.allow_registry_metadata_redirects
+                         and corporate_registry_matches(self.registry, os.environ.get("DEPLOOM_DRAFT_PRIVATE_METADATA_REGISTRY", ""))))
+
     def fetch_npm_metadata(self, pkg: str):
         return self._fetch_npm_metadata_result(pkg)[0]
 
@@ -3037,6 +3052,8 @@ class LiveDataClient:
         """Return the packument and whether it is reusable by an independent client."""
         from planning_cache import planning_lease
 
+        if self._private_metadata_blocked(pkg):
+            raise RegistryInfrastructureError("PRIVATE_METADATA_REGISTRY_UNAPPROVED")
         context, durable = self.metadata_request_context()
         if (not durable or self.metadata_cache_dir is None or self.metadata_cache_ttl <= 0
                 or (context == self._metadata_request_context and pkg in self.npm_cache)):
@@ -3178,7 +3195,19 @@ class LiveDataClient:
         max_match_evaluations: int | None = None,
     ):
         from npm_semver_batch import match_npm_semver_many
-        from registry_advisory_evidence import query_registry_advisories
+        from registry_advisory_evidence import RegistryAdvisoryEvidence, query_registry_advisories
+
+        configured_source = os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE", "").rstrip("/")
+        metadata_approval = os.environ.get("DEPLOOM_DRAFT_PRIVATE_METADATA_REGISTRY", "")
+        private_allowed = (os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1"
+                           and configured_source == approved_registry.rstrip("/")
+                           and (corporate_registry_matches(self.registry, metadata_approval)
+                                or _corporate_advisory_fallback(self.registry)))
+        blocked = {pair: RegistryAdvisoryEvidence("UNKNOWN", "REGISTRY_NOT_APPROVED")
+                   for pair in pairs if not private_allowed and _private_package(pair[0])}
+        permitted = [pair for pair in pairs if pair not in blocked]
+        if not permitted:
+            return blocked
 
         def match_many(comparisons):
             timeout = self._budgeted_timeout()
@@ -3186,11 +3215,12 @@ class LiveDataClient:
                 comparisons, timeout_seconds=timeout[1] if isinstance(timeout, tuple) else timeout,
             )
 
-        return self._supervised(lambda: query_registry_advisories(
-            self.session, self.registry, approved_registry, pairs,
+        evidence = self._supervised(lambda: query_registry_advisories(
+            self.session, self.registry, approved_registry, permitted,
             match_many=match_many, timeout=self._budgeted_timeout(),
             max_match_evaluations=max_match_evaluations,
         ))
+        return {**blocked, **evidence}
 
     def _query_registry_security_pairs(
         self, pairs: List[Tuple[str, str]], approved_registry: str,
@@ -3264,6 +3294,8 @@ class LiveDataClient:
             if approved_registry:
                 return self._query_registry_security_versions(pkg, versions, approved_registry)
             raise VulnerabilityEvidenceUnavailable("External vulnerability queries disabled by host policy")
+        if _private_package(pkg):
+            raise VulnerabilityEvidenceUnavailable("PRIVATE_SCOPE_EXCLUDED")
         result: Dict[str, List[Dict[str, Any]]] = {}
         missing = [v for v in versions if (pkg, v) not in self.osv_cache]
         self.progress(operation=f"OSV query ({len(missing)} version(s))", package=pkg, step="scan")
@@ -3441,14 +3473,20 @@ class LiveDataClient:
             return None
 
 
-    def fetch_bytes(self, url: str, quiet: bool = True, max_bytes: int = 8 * 1024 * 1024) -> Optional[bytes]:
-        if url in self.bytes_cache:
-            return self.bytes_cache[url]
+    def fetch_bytes(self, url: str, quiet: bool = True, max_bytes: int = 8 * 1024 * 1024, *,
+                    allow_redirects: bool = True) -> Optional[bytes]:
+        cache_key = url if allow_redirects else (url, "no-redirect")
+        if cache_key in self.bytes_cache:
+            return self.bytes_cache[cache_key]
         self.progress(operation="fetch data", step="scan")
         try:
             response = self._supervised(
-                lambda url=url: self.session.get(url, timeout=self._budgeted_timeout(), stream=True)
+                lambda url=url: self.session.get(url, timeout=self._budgeted_timeout(), stream=True,
+                                                 **({} if allow_redirects else {"allow_redirects": False}))
             )
+            if not allow_redirects and 300 <= response.status_code < 400:
+                response.close()
+                return None
             response.raise_for_status()
             content_length = int(response.headers.get("Content-Length") or 0)
             if content_length and content_length > max_bytes:
@@ -3458,7 +3496,7 @@ class LiveDataClient:
             # budget check on every socket read, so a slow trickle cannot hold
             # a full 64KiB chunk open past the deadline.
             data = self._bounded_read_max(response, max_bytes)
-            self.bytes_cache[url] = data
+            self.bytes_cache[cache_key] = data
             self._bounded_sleep(self.sleep_sec)
             return data
         except DraftBudgetExceeded:
@@ -3466,7 +3504,7 @@ class LiveDataClient:
         except Exception as exc:
             if not quiet:
                 eprint(f"[warn] bytes unavailable {url}: {exc}")
-            self.bytes_cache[url] = None
+            self.bytes_cache[cache_key] = None
             return None
 
     def _bounded_read_max(self, response, max_bytes: int) -> bytes:
@@ -3905,6 +3943,9 @@ def analyze_release_text(text: str, current: str, target: str, source_count: int
 def build_release_intelligence(client: LiveDataClient, package: str, meta: Dict[str, Any], current: str, target: str) -> ReleaseIntelligence:
     if not target_is_action(target):
         return ReleaseIntelligence(target=target, status="not-applicable", summary="Для строки нет target-обновления")
+    if _private_package(package):
+        return ReleaseIntelligence(target=target, status="unavailable",
+                                   summary="External release lookups are disabled for private packages")
     repo_url = repository_url_from_metadata(meta, target)
     repo = github_repo_parts(repo_url)
     sources: List[Dict[str, str]] = []
@@ -5310,7 +5351,9 @@ def analyze_project(
                 notes="; ".join(notes + ["package unavailable in configured npm registry"]),
                 draft_scan_state="done",
                 draft_unknown="registry-failed",
-                current_security_evidence={"status": "UNKNOWN", "reason": "REGISTRY_METADATA_UNAVAILABLE"},
+                current_security_evidence={"status": "UNKNOWN", "reason": (
+                    "PRIVATE_METADATA_REGISTRY_UNAPPROVED" if isinstance(client, LiveDataClient) and client._private_metadata_blocked(name)
+                    else "REGISTRY_METADATA_UNAVAILABLE")},
             )
             if draft_sink is not None:
                 _commit_draft_row(draft_sink, unavailable_row)

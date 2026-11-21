@@ -202,3 +202,60 @@ class OfflineEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["confirmed"], {"status": "ASSESSED", "source": "OFFLINE_OSV_NPM", "findingCount": 0})
         self.assertEqual(evidence["ranged"], {"status": "UNKNOWN", "reason": "CURRENT_VERSION_UNRESOLVED"})
         self.assertEqual(evidence["local"], {"status": "UNKNOWN", "reason": "NON_REGISTRY_SPEC"})
+
+    def test_private_worker_and_secondary_lookups_require_the_approved_metadata_route(self):
+        import dependency_live_roadmap_generator as core
+        registry = "https://fixture.example.test/npm"
+        private = "@internal/dynamic-peer"
+        for offline in ("", str(self.root)):
+            for selected, approved, restricted in (
+                ("https://registry.npmjs.org", "https://registry.npmjs.org", "1"),
+                (registry, registry + "/other", "1"), (registry, "", "1"), (registry, registry, "0"),
+            ):
+                env = {"DEPLOOM_DRAFT_OSV_DIR": offline, "DEPLOOM_DRAFT_PRIVATE_SCOPES": "@public, @Internal",
+                       "DEPLOOM_DRAFT_PRIVATE_METADATA_REGISTRY": approved, "DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE": restricted,
+                       "DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE": selected}
+                with self.subTest(offline=bool(offline), selected=selected, restricted=restricted), patch.dict(os.environ, env):
+                    client = core.LiveDataClient(selected, timeout=2, batch_size=16, sleep_sec=0)
+                    self.addCleanup(client.session.close)
+                    worker = core._registry_prefetch_client(client)
+                    self.addCleanup(worker.session.close)
+                    with patch.object(worker.session, "request") as request:
+                        # Includes names first discovered after the project preflight.
+                        with self.assertRaisesRegex(core.RegistryInfrastructureError, "PRIVATE_METADATA"):
+                            worker._fetch_npm_metadata_result(private)
+                        self.assertEqual(worker.registry_exact_version_manifest(private, "1.0.0")[1],
+                                         "PRIVATE_METADATA_REGISTRY_UNAPPROVED")
+                        with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                            worker.query_osv_versions(private, ["1.0.0"])
+                        self.assertEqual(worker.query_registry_advisory_evidence([(private, "1.0.0")], selected)
+                                         [private, "1.0.0"].status, "UNKNOWN")
+                        release = worker.fetch_release_intelligence(private, {"repository": "https://github.com/example/private"},
+                                                                   "1.0.0", "2.0.0")
+                        self.assertEqual(release.status, "unavailable")
+                        request.assert_not_called()
+
+    def test_approved_private_metadata_does_not_require_or_imply_advisory_approval(self):
+        import dependency_live_roadmap_generator as core
+        registry = "https://fixture.example.test/npm"
+        private = "@internal/example"
+        for offline in ("", str(self.root)):
+            env = {"DEPLOOM_DRAFT_OSV_DIR": offline, "DEPLOOM_DRAFT_PRIVATE_SCOPES": "@internal",
+                   "DEPLOOM_DRAFT_PRIVATE_METADATA_REGISTRY": registry, "DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE": "1",
+                   "DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE": "", "DEPLOOM_DRAFT_CORPORATE_ADVISORY_SOURCE": ""}
+            with self.subTest(offline=bool(offline)), patch.dict(os.environ, env):
+                client = core.LiveDataClient(registry, timeout=2, batch_size=16, sleep_sec=0)
+                self.addCleanup(client.session.close)
+                worker = core._registry_prefetch_client(client)
+                self.addCleanup(worker.session.close)
+                with patch.object(worker.session, "get") as get, patch.object(worker, "_bounded_json", return_value={
+                    "name": private, "versions": {"1.0.0": {"dist": {"tarball": registry + "/example.tgz"}}},
+                    "dist-tags": {"latest": "1.0.0"},
+                }), patch.object(worker.session, "post") as post:
+                    get.return_value.status_code = 200
+                    get.return_value.headers = {}
+                    self.assertEqual(worker.fetch_npm_metadata(private)["name"], private)
+                    self.assertFalse(get.call_args.kwargs["allow_redirects"])
+                    with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                        worker.query_osv_versions(private, ["1.0.0"])
+                    post.assert_not_called()

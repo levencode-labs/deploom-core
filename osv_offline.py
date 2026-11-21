@@ -104,6 +104,10 @@ def _names(value):
     return {item.strip() for item in value.split(",") if item.strip()}
 
 
+def private_package(package, private_scopes):
+    return package.partition("/")[0].casefold() in {scope.casefold() for scope in _names(private_scopes)}
+
+
 def assess(directory, package, versions, private_scopes="", public_names=""):
     """Return separate evidence and the first blocking reason for each exact pair."""
     db, info = snapshot(directory)
@@ -118,7 +122,7 @@ def assess_database(db, package, versions, private_scopes="", public_names=""):
     def unknown(code):
         return {raw: PairAssessment(reason=code) for raw in versions}
 
-    if package.split("/")[0] in _names(private_scopes):
+    if private_package(package, private_scopes):
         return unknown("PRIVATE_SCOPE_EXCLUDED")
     try:
         with closing(sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)) as conn:

@@ -60,14 +60,20 @@ def registry_advisory_source_matches(registry: str, approved_registry: str) -> b
         return False
 
 
-def corporate_advisory_source_matches(registry: str, approved_registry: str, corporate_registry: str) -> bool:
-    """Require independent host designation before sending offline coverage gaps."""
-    if not corporate_registry or not registry_advisory_source_matches(registry, approved_registry):
+def corporate_registry_matches(registry: str, host_approved: str) -> bool:
+    """A host-approved HTTPS registry that cannot resolve to a known public npm endpoint by spelling."""
+    if not host_approved or not registry_advisory_source_matches(registry, host_approved):
         return False
     hostname = urlsplit(registry).hostname.lower().rstrip(".")
     public_domains = ("npmjs.org", "npmjs.com", "yarnpkg.com")
-    return (hostname.isascii() and registry.rstrip("/") == corporate_registry.rstrip("/")
-            and not any(hostname == domain or hostname.endswith("." + domain) for domain in public_domains))
+    return hostname.isascii() and not any(hostname == domain or hostname.endswith("." + domain)
+                                         for domain in public_domains)
+
+
+def corporate_advisory_source_matches(registry: str, approved_registry: str, corporate_registry: str) -> bool:
+    """Require separate host designation before sending offline coverage gaps."""
+    return (corporate_registry_matches(registry, corporate_registry)
+            and registry.rstrip("/") == approved_registry.rstrip("/"))
 
 
 def _canonical_advisory_id(identifier, url):
