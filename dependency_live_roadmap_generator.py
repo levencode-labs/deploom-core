@@ -56,7 +56,6 @@ import io
 import itertools
 import json
 import os
-import sqlite3
 import re
 import subprocess
 import sys
@@ -185,6 +184,7 @@ from lockfile_consistency import (
 )
 from semantic_version import NpmSpec, Version
 import osv_offline
+from registry_advisory_evidence import corporate_advisory_source_matches
 from block_v_predicate_search import prioritize_probe_preference
 from block_psi55_resolver_overrides import (
     propose_duplicate_type_override,
@@ -1102,6 +1102,7 @@ class DependencyRow:
     # (registry request raised) / "osv-unavailable" (metadata OK, OSV failed).
     # Pending/interrupted rows are derived from draft_scan_state instead.
     draft_unknown: str = ""
+    current_security_evidence: Dict[str, Any] = dataclasses.field(default_factory=dict)
     # Publication-only uncertainty; registry/OSV observations stay unchanged.
     draft_planning_unknown: str = ""
     # R12: an explicitly bounded candidate search (draft-max-candidates / max-candidates)
@@ -2387,6 +2388,12 @@ def resolved_current_version(
     )
 
 
+def _unresolved_current_range(source: str, declaration: str, current: str) -> bool:
+    return (source.startswith("package.json") and not (
+        osv_offline.is_exact_version(current)
+        and re.fullmatch(r"(?:=\s*)?v?" + re.escape(current), declaration.strip())))
+
+
 def _draft_progress(client: Any, **kwargs: Any) -> None:
     """Best-effort Draft progress emission that tolerates non-LiveData clients.
 
@@ -2400,6 +2407,13 @@ def _draft_progress(client: Any, **kwargs: Any) -> None:
             progress(**kwargs)
         except Exception:
             pass
+
+
+def _corporate_advisory_fallback(registry):
+    return (os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1"
+            and corporate_advisory_source_matches(
+                registry, os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE", ""),
+                os.environ.get("DEPLOOM_DRAFT_CORPORATE_ADVISORY_SOURCE", "")))
 
 
 class LiveDataClient:
@@ -3199,19 +3213,52 @@ class LiveDataClient:
             raise VulnerabilityEvidenceUnavailable("REGISTRY_ADVISORY_EVIDENCE_UNAVAILABLE")
         return {version: assessed[pkg, version] for version in versions}
 
+    def _query_offline_versions(self, offline, pkg, versions, diagnostics):
+        assessments = osv_offline.assess(offline, pkg, versions,
+                                         os.environ.get("DEPLOOM_DRAFT_PRIVATE_SCOPES", ""),
+                                         os.environ.get("DEPLOOM_DRAFT_PUBLIC_NAMES", ""))
+        missing = [(pkg, version) for version, item in assessments.items()
+                   if item.reason and osv_offline.is_exact_version(version)]
+        fallback = {}
+        if missing and _corporate_advisory_fallback(self.registry):
+            fallback = self.query_registry_advisory_evidence(missing, self.registry)
+        results = {}
+        for version, assessment in assessments.items():
+            source = "OFFLINE_OSV_NPM"
+            evidence = {}
+            if assessment.reason:
+                evidence["osvReason"] = assessment.reason
+            record = fallback.get((pkg, version))
+            if record is not None:
+                evidence["registryReason"] = record.reason
+                if record.status in {"AFFECTED", "NO_REPORTED_ADVISORIES"}:
+                    try:
+                        source = ("OFFLINE_OSV_NPM_AND_REGISTRY" if assessment.findings else "REGISTRY_BULK_ADVISORY")
+                        assessment = osv_offline.supplement(assessment, record)
+                    except ValueError:
+                        evidence["registryReason"] = "INVALID_ADVISORY_OR_RANGE"
+            if assessment.reason:
+                evidence.update(status="UNKNOWN", reason=assessment.reason)
+            else:
+                results[version] = assessment.entries()
+                evidence.update(status="ASSESSED", source=source, findingCount=len(results[version]))
+            diagnostics[version] = evidence
+        if assessments and not results:
+            reasons = sorted({diagnostics[version]["reason"] for version in assessments})
+            raise VulnerabilityEvidenceUnavailable(", ".join(reasons))
+        return results
+
     def query_osv_versions(
         self,
         pkg: str,
         versions: List[str],
         progress_label: str = "",
+        *,
+        diagnostics: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         offline = os.environ.get("DEPLOOM_DRAFT_OSV_DIR")
         if offline:
-            try:
-                return osv_offline.query(offline, pkg, versions, os.environ.get("DEPLOOM_DRAFT_PRIVATE_SCOPES", ""),
-                                         os.environ.get("DEPLOOM_DRAFT_PUBLIC_NAMES", ""))
-            except (OSError, ValueError, sqlite3.Error) as exc:
-                raise VulnerabilityEvidenceUnavailable(str(exc)) from exc
+            return self._query_offline_versions(offline, pkg, versions, diagnostics if diagnostics is not None else {})
         if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
             approved_registry = os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE")
             if approved_registry:
@@ -5217,6 +5264,7 @@ def analyze_project(
                 min_lag_12m="—", min_lag_9m="—", min_lag_6m="—", min_lag_3m="—",
                 group=group, reason=reason,
                 notes="; ".join(notes + ["non-registry spec; проверить внутренний registry/advisory"]),
+                current_security_evidence={"status": "UNKNOWN", "reason": "NON_REGISTRY_SPEC"},
                 draft_scan_state="done",
             )
             if draft_sink is not None:
@@ -5262,6 +5310,7 @@ def analyze_project(
                 notes="; ".join(notes + ["package unavailable in configured npm registry"]),
                 draft_scan_state="done",
                 draft_unknown="registry-failed",
+                current_security_evidence={"status": "UNKNOWN", "reason": "REGISTRY_METADATA_UNAVAILABLE"},
             )
             if draft_sink is not None:
                 _commit_draft_row(draft_sink, unavailable_row)
@@ -5393,8 +5442,15 @@ def analyze_project(
                     + "); безопасный target среди покрытых не доказан — нужен полный OSV-запрос"
                 )
                 notes.append(candidate_search_truncated_note)
+        diagnostics = {}
+        offline_query = isinstance(client, LiveDataClient) and os.environ.get("DEPLOOM_DRAFT_OSV_DIR")
+        if offline_query and _unresolved_current_range(current_source, spec, current):
+            # A range lower bound is a planning hint; it does not identify the installed package.
+            diagnostics[current] = {"status": "UNKNOWN", "reason": "CURRENT_VERSION_UNRESOLVED"}
+            osv_candidates = [version for version in osv_candidates if version != current]
         try:
-            vulns = client.query_osv_versions(name, osv_candidates, progress_label=dependency_label)
+            vulns = client.query_osv_versions(name, osv_candidates, progress_label=dependency_label,
+                                             **({"diagnostics": diagnostics} if offline_query else {}))
         except VulnerabilityEvidenceUnavailable as exc:
             if os.environ.get("DEPLOOM_DRAFT_OSV_DIR"):
                 notes.append("Offline OSV: " + str(exc))
@@ -5481,7 +5537,8 @@ def analyze_project(
             registry_candidate_diagnostics=registry_candidate_diagnostics,
             vuln_evidence_by_version={v: vuln_summary(entries) for v, entries in (vulns or {}).items()},
             draft_scan_state="done",
-            draft_unknown="osv-unavailable" if vulns is None else "",
+            draft_unknown="osv-unavailable" if vulns is None or current not in vulns else "",
+            current_security_evidence=diagnostics.get(current, {}),
             candidate_search_truncated=candidate_search_truncated,
             candidate_search_truncated_note=candidate_search_truncated_note,
         )
@@ -24515,16 +24572,25 @@ def enrich_final_registry_security(
             parsed = safe_version(version)
             if parsed is None or str(parsed) != version or _projected_row_security_full(row, target)[-1]:
                 continue
+            if (os.environ.get("DEPLOOM_DRAFT_OSV_DIR") and version == row.current_version
+                    and (row.current_security_evidence.get("osvReason")
+                         or _unresolved_current_range(row.current_source, row.requested_spec, version))):
+                # This run already queried this exact pair, or lacks an exact current version.
+                continue
             missing[row.name, version].append(row)
     if not missing:
         return
     if os.environ.get("DEPLOOM_DRAFT_OSV_DIR"):
         assessed = {}
         for pkg, version in missing:
+            diagnostics = {}
             try:
-                assessed[pkg, version] = client.query_osv_versions(pkg, [version])[version]
+                assessed[pkg, version] = client.query_osv_versions(pkg, [version], diagnostics=diagnostics)[version]
             except VulnerabilityEvidenceUnavailable:
-                continue
+                pass
+            for row in missing[pkg, version]:
+                if row.current_version == version and version in diagnostics:
+                    row.current_security_evidence = diagnostics[version]
     else:
         assessed = client._query_registry_security_pairs(sorted(missing), approved_registry)
     for pair, advisories in assessed.items():
@@ -24533,6 +24599,8 @@ def enrich_final_registry_security(
         for row in missing[pair]:
             if version == row.current_version:
                 row.current_vulns = summary
+                if row.draft_unknown == "osv-unavailable":
+                    row.draft_unknown = ""
             else:
                 row.vuln_evidence_by_version[version] = summary
 
@@ -24768,6 +24836,8 @@ def build_draft_plan(
                 "breakingChanges": list(row.breaking_changes or []),
                 "migrationNotes": list(row.migration_notes or []),
             }
+            if row.current_security_evidence:
+                entry["currentSecurityEvidence"] = dict(row.current_security_evidence)
             if row.registry_candidate_diagnostics:
                 entry["registryCandidateDiagnostics"] = row.registry_candidate_diagnostics
             if registry_no_target_code:
@@ -26239,6 +26309,8 @@ def _build_draft_execution_context(
                 ctx["commands"] = commands
     if registry:
         ctx.setdefault("registry", _sanitize_registry_url(registry))
+        if os.environ.get("DEPLOOM_DRAFT_OSV_DIR"):
+            ctx["registryFallbackEnabled"] = _corporate_advisory_fallback(registry)
     if input_hashes:
         ctx.setdefault("inputHashes", input_hashes)
     if artifacts_dir is not None:
@@ -26603,6 +26675,7 @@ def publish_draft_result(
                if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1"
                and os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE") else {}),
             **({"securityEvidenceMode": "OFFLINE_OSV_NPM", "fullDependencyTreeSecurityVerified": False,
+                "registryFallbackEnabled": exec_ctx.get("registryFallbackEnabled") is True,
                 "securitySnapshot": osv_offline.snapshot(os.environ["DEPLOOM_DRAFT_OSV_DIR"])[1]}
                if os.environ.get("DEPLOOM_DRAFT_OSV_DIR") else {}),
         },

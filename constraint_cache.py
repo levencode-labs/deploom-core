@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -43,6 +45,7 @@ CONSTRAINT_ENTRY_SCHEMA = "verified-resolver-exact-assignment-v4-context-safe"
 SOLVER_SCHEMA_VERSION = "peer-ir-v4-context-safe-exact-exclusion"
 _CACHE_WRITE_THREAD_LOCK = threading.RLock()
 _WINDOWS_PERMISSION_GRACE_SECONDS = 0.25
+_CACHE_WRITE_TIMEOUT = 10.0
 _ENV_FILES = (
     "package.json",
     "package-lock.json",
@@ -359,118 +362,89 @@ class LearnedConstraintProof:
         }
 
 
+def _wait_for_cache_lock(deadline: float, path: Path) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"constraint cache lock timed out: {path}")
+    time.sleep(min(0.05, remaining))
+
+
 @contextmanager
 def _exclusive_cache_write_lock(path: Path):
-    """Serialize cache writers across threads and processes.
-
-    Same-process writers are serialized by an RLock. The lock file provides
-    cross-process exclusion. On Windows CREATE_NEW/O_EXCL can transiently return
-    PermissionError/EACCES while another process is releasing the lock file.
-    That race can be observed after the path has already disappeared, so a
-    short bounded grace retry is required before classifying it as a real
-    permissions failure.
-
-    Authority is fail-closed:
-    - transient sharing races are retried;
-    - persistent permissions failures are raised;
-    - lock acquisition timeout is raised;
-    - no failed acquisition can publish cache contents.
-    """
-    lock_path = path.with_name(path.name + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-
+    """Serialize writers without taking ownership based on a file timestamp."""
+    marker = path.with_name(path.name + ".lock")
+    guard = path.with_name(path.name + ".writer-guard")
+    path.parent.mkdir(parents=True, exist_ok=True)
     with _CACHE_WRITE_THREAD_LOCK:
-        deadline = time.monotonic() + 10.0
-        permission_grace_started: Optional[float] = None
-        fd: Optional[int] = None
-
+        deadline = time.monotonic() + _CACHE_WRITE_TIMEOUT
+        permission_deadline = time.monotonic() + _WINDOWS_PERMISSION_GRACE_SECONDS
         while True:
             try:
-                fd = os.open(
-                    str(lock_path),
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                )
-                os.write(
-                    fd,
-                    f"pid={os.getpid()} created={time.time()}\n".encode("utf-8"),
-                )
+                fd = os.open(guard, os.O_CREAT | os.O_RDWR, 0o600)
                 break
-            except FileExistsError:
-                # Normal contention. Any earlier "path disappeared" grace is no
-                # longer relevant because a lock is visibly present again.
-                permission_grace_started = None
             except PermissionError:
-                now = time.monotonic()
-                try:
-                    lock_exists = lock_path.exists()
-                except OSError:
-                    # If even probing the path is denied, keep the operation
-                    # fail-closed rather than guessing that the lock is absent.
+                if time.monotonic() >= permission_deadline:
                     raise
-
-                if lock_exists:
-                    # Windows may report EACCES instead of EEXIST while another
-                    # process owns CREATE_NEW. Treat it as ordinary contention.
-                    permission_grace_started = None
-                else:
-                    # TOCTOU: the owning process may have deleted the lock after
-                    # CREATE_NEW returned its sharing violation but before this
-                    # existence check. Retry briefly; a persistent ACL failure
-                    # still escapes after the bounded grace period.
-                    if permission_grace_started is None:
-                        permission_grace_started = now
-                    elif now - permission_grace_started >= _WINDOWS_PERMISSION_GRACE_SECONDS:
-                        raise
-
-            try:
-                stat = lock_path.stat()
-            except FileNotFoundError:
-                stat = None
-            except PermissionError:
-                # Active Windows sharing contention. Acquisition retry below is
-                # still bounded by the main deadline.
-                stat = None
-
-            if stat is not None and time.time() - stat.st_mtime > 120.0:
-                try:
-                    lock_path.unlink()
-                except FileNotFoundError:
-                    pass
-                except PermissionError:
-                    # A live Windows owner can deny delete sharing.
-                    pass
-                else:
-                    permission_grace_started = None
-                    continue
-
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"constraint cache lock timed out: {lock_path}"
-                )
-
-            time.sleep(
-                0.01
-                if permission_grace_started is not None
-                else 0.05
-            )
-
+                _wait_for_cache_lock(deadline, guard)
         try:
-            yield
-        finally:
-            if fd is not None:
-                os.close(fd)
-
-            cleanup_deadline = time.monotonic() + 1.0
             while True:
                 try:
-                    lock_path.unlink()
+                    if os.name == "nt":
+                        import msvcrt
+                        # Windows permits locking a byte range beyond EOF.
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
-                except FileNotFoundError:
-                    break
-                except PermissionError:
-                    if time.monotonic() >= cleanup_deadline:
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
                         raise
-                    time.sleep(0.01)
+                    _wait_for_cache_lock(deadline, guard)
+
+            # Older processes claim a *file* here with CREATE_NEW. They cannot
+            # unlink our directory even if a live writer is paused for minutes.
+            # An empty directory left by a killed new writer is reusable only
+            # after the kernel grants this process the persistent outer guard.
+            permission_deadline = None
+            while True:
+                try:
+                    marker.mkdir(mode=0o700)
+                    break
+                except (FileExistsError, PermissionError) as exc:
+                    try:
+                        mode = marker.lstat().st_mode
+                    except FileNotFoundError:
+                        if isinstance(exc, PermissionError):
+                            now = time.monotonic()
+                            if permission_deadline is None:
+                                permission_deadline = now + _WINDOWS_PERMISSION_GRACE_SECONDS
+                            elif now >= permission_deadline:
+                                raise exc
+                    else:
+                        permission_deadline = None
+                        if stat.S_ISDIR(mode) and not any(marker.iterdir()):
+                            break
+                    # A legacy regular-file marker may still have a live owner.
+                    # Leave even an old or orphaned legacy marker untouched.
+                    _wait_for_cache_lock(deadline, marker)
+            try:
+                yield
+            finally:
+                cleanup_deadline = time.monotonic() + 1.0
+                while True:
+                    try:
+                        marker.rmdir()
+                        break
+                    except PermissionError:
+                        if time.monotonic() >= cleanup_deadline:
+                            raise
+                        time.sleep(0.01)
+        finally:
+            # Closing also releases the OS lock on exceptions and process exit.
+            # Keep the guard pathname stable for queued/new file descriptors.
+            os.close(fd)
+
 
 def _constraint_entry_key(payload: Mapping[str, object]) -> str:
     canonical = {

@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/DepLoom/core"
+Repository = "https://github.com/levencode-labs/deploom-core"
 
 [project.scripts]
 deploom-core = "dependency_live_roadmap_generator:main"

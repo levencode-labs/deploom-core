@@ -23,6 +23,7 @@ class RegistryAdvisory:
     identifier: str
     severity: str
     vulnerable_range: str
+    canonical_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,27 @@ def registry_advisory_source_matches(registry: str, approved_registry: str) -> b
         )
     except ValueError:
         return False
+
+
+def corporate_advisory_source_matches(registry: str, approved_registry: str, corporate_registry: str) -> bool:
+    """Require independent host designation before sending offline coverage gaps."""
+    if not corporate_registry or not registry_advisory_source_matches(registry, approved_registry):
+        return False
+    hostname = urlsplit(registry).hostname.lower().rstrip(".")
+    public_domains = ("npmjs.org", "npmjs.com", "yarnpkg.com")
+    return (hostname.isascii() and registry.rstrip("/") == corporate_registry.rstrip("/")
+            and not any(hostname == domain or hostname.endswith("." + domain) for domain in public_domains))
+
+
+def _canonical_advisory_id(identifier, url):
+    ghsa = r"GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}"
+    if isinstance(url, str):
+        match = re.fullmatch(r"https://github[.]com/advisories/(" + ghsa + ")", url, re.IGNORECASE)
+        if match:
+            return match[1].upper()
+    if re.fullmatch(ghsa + r"|CVE-[0-9]{4}-[0-9]{4,}", identifier, re.IGNORECASE):
+        return identifier.upper()
+    return None
 
 
 def valid_registry_advisory_name(name: str) -> bool:
@@ -165,7 +187,8 @@ def query_registry_advisories(
                         record_unknown(pair, "MATCH_BUDGET_EXHAUSTED")
                         break
                     comparisons[key] = None
-                parsed.append(RegistryAdvisory(str(identifier), severity, spec))
+                parsed.append(RegistryAdvisory(str(identifier), severity, spec,
+                                               _canonical_advisory_id(str(identifier), record.get("url"))))
             if pair not in evidence:
                 prepared[pair] = parsed
         except ValueError:
