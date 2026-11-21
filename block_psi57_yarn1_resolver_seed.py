@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from prepared_workspace_fastpath import WorkspaceChangeGuard
+from project_runtime import run_version_probe
 from reparse_materialization import inventory_reparse_plan
 from substrate_identity import tool_build_id
 from verification_workspace_backend import materialize_private_tree
@@ -63,24 +64,8 @@ def yarn1_runtime_version(executable: str) -> str:
         cached = _RUNTIME_VERSION_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    path = Path(command)
-    if os.name == "nt" and path.suffix.lower() in {".cmd", ".bat"}:
-        comspec = os.environ.get("COMSPEC") or "cmd.exe"
-        quoted = subprocess.list2cmdline([command, "--version"])
-        argv = [comspec, "/d", "/s", "/c", quoted]
-    else:
-        argv = [command, "--version"]
     try:
-        result = subprocess.run(
-            argv,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            check=False,
-        )
+        result = run_version_probe(command, os.environ, 10)
         version = (result.stdout or "").strip().splitlines()
         value = version[0].strip() if result.returncode == 0 and version else ""
     except (OSError, subprocess.SubprocessError):

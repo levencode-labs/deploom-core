@@ -640,12 +640,16 @@ def _create_junction(link: Path, target: Path) -> bool:
 
 
 def _remove_junction(path: Path) -> None:
+    if '"' in str(path) or any(ord(char) < 32 for char in str(path)):
+        return
     try:
         os.rmdir(path)
     except OSError:
         try:
             subprocess.run(
-                [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", "rmdir", str(path)],
+                subprocess.list2cmdline([os.environ.get("COMSPEC") or "cmd.exe"])
+                + ' /d /v:off /c rmdir "%DEPLOOM_JUNCTION_LINK%"',
+                env={**os.environ, "DEPLOOM_JUNCTION_LINK": str(path)},
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=15,

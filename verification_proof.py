@@ -14,7 +14,7 @@ from typing import Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 from semantic_version import NpmSpec
-from project_runtime import normalize_npm_range
+from project_runtime import normalize_npm_range, run_version_probe
 from block_vex_storage import semantic_verification_environment
 from verification_observability import emit_observability_event
 from substrate_identity import tool_build_id
@@ -958,25 +958,8 @@ def _effective_yarn_config_identity(
 
 def _version_identity(executable: str, environment: Mapping[str, str]) -> str:
     path = Path(executable)
-    argv: list[str]
-    if os.name == "nt" and path.suffix.lower() in {".cmd", ".bat"}:
-        comspec = environment.get("COMSPEC") or os.environ.get("COMSPEC") or "cmd.exe"
-        quoted = subprocess.list2cmdline([str(path), "--version"])
-        argv = [comspec, "/d", "/s", "/c", quoted]
-    else:
-        argv = [str(path), "--version"]
     try:
-        completed = subprocess.run(
-            argv,
-            env=dict(environment),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            check=False,
-        )
+        completed = run_version_probe(executable, environment, 10)
         version = (completed.stdout or "").strip().splitlines()
         version_text = version[0] if version else f"exit:{completed.returncode}"
     except (OSError, subprocess.SubprocessError):

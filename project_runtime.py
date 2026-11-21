@@ -88,26 +88,25 @@ def _candidate_directories() -> List[Path]:
     return values
 
 
+def run_version_probe(executable: str, environment: Mapping[str, str], timeout: int):
+    """Run a fixed --version command, including Windows toolchain shims."""
+    env = dict(environment)
+    if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
+        if '"' in executable or any(ord(char) < 32 for char in executable):
+            raise OSError("Invalid Windows executable path")
+        shell = env.get("COMSPEC") or os.environ.get("COMSPEC") or "cmd.exe"
+        env["DEPLOOM_VERSION_EXECUTABLE"] = executable
+        argv = subprocess.list2cmdline([shell]) + ' /d /v:off /s /c ""%DEPLOOM_VERSION_EXECUTABLE%" --version"'
+    else:
+        argv = [executable, "--version"]
+    return subprocess.run(argv, env=env, text=True, encoding="utf-8", errors="replace",
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+
+
 def probe_node_version(executable: str, timeout_seconds: int = 5) -> str:
     """Run ``node --version`` for the executable; exact version or ''."""
-    path = Path(executable)
-    argv: List[str]
-    if os.name == "nt" and path.suffix.lower() in {".cmd", ".bat"}:
-        comspec = os.environ.get("COMSPEC") or "cmd.exe"
-        argv = [comspec, "/d", "/s", "/c", subprocess.list2cmdline([str(path), "--version"])]
-    else:
-        argv = [str(path), "--version"]
     try:
-        completed = subprocess.run(
-            argv,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout_seconds,
-            check=False,
-        )
+        completed = run_version_probe(executable, os.environ, timeout_seconds)
     except (OSError, subprocess.SubprocessError):
         return ""
     first = (completed.stdout or "").strip().splitlines()
