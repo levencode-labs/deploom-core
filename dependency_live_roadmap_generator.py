@@ -3263,27 +3263,33 @@ class LiveDataClient:
             raise VulnerabilityEvidenceUnavailable("REGISTRY_ADVISORY_EVIDENCE_UNAVAILABLE")
         return {version: assessed[pkg, version] for version in versions}
 
-    def _query_offline_versions(self, offline, pkg, versions, diagnostics, excluded_public_version=None):
+    def _query_offline_versions(self, offline, pkg, versions, diagnostics, excluded_public_version, public_fallback):
         assessments = osv_offline.assess(offline, pkg, versions,
                                          os.environ.get("DEPLOOM_DRAFT_PRIVATE_SCOPES", ""),
                                          os.environ.get("DEPLOOM_DRAFT_PUBLIC_NAMES", ""))
         meta = self.npm_cache.get(pkg)
         public_versions = set()
+        public_gaps = []
         if (isinstance(meta, DirectRegistryPackument) and self.registry == PUBLIC_NPM_REGISTRY
                 and self.metadata_request_context() == (self._metadata_request_context, True)):
             for version, assessment in assessments.items():
-                if (assessment.reason == "PUBLIC_PACKAGE_UNCONFIRMED"
-                        and osv_offline.is_exact_version(version) and published_version(meta, pkg, version) is not None):
-                    if version == excluded_public_version:
-                        assessment.reason = "LOCKED_PUBLIC_ARTIFACT_UNCONFIRMED"
-                        continue
+                if (not assessment.reason or _private_package(pkg) or not osv_offline.is_exact_version(version)
+                        or published_version(meta, pkg, version) is None):
+                    continue
+                if version == excluded_public_version:
+                    assessment.reason = "LOCKED_PUBLIC_ARTIFACT_UNCONFIRMED"
+                elif assessment.reason == "PUBLIC_PACKAGE_UNCONFIRMED":
                     assessments[version] = osv_offline.PairAssessment()
                     public_versions.add(version)
+                elif public_fallback and os.environ.get("DEPLOOM_DRAFT_PUBLIC_ADVISORY_FALLBACK") == "1":
+                    public_gaps.append((pkg, version))
         missing = [(pkg, version) for version, item in assessments.items()
                    if item.reason and osv_offline.is_exact_version(version)]
         fallback = {}
         if missing and _corporate_advisory_fallback(self.registry):
             fallback = self.query_registry_advisory_evidence(missing, self.registry)
+        elif public_gaps:
+            fallback = self.query_registry_advisory_evidence(public_gaps, PUBLIC_NPM_REGISTRY)
         results = {}
         for version, assessment in assessments.items():
             source = "OFFLINE_OSV_NPM"
@@ -3320,11 +3326,12 @@ class LiveDataClient:
         *,
         diagnostics: Optional[Dict[str, Dict[str, Any]]] = None,
         excluded_public_version: Optional[str] = None,
+        public_fallback: bool = False,
     ) -> Dict[str, List[Dict[str, Any]]]:
         offline = os.environ.get("DEPLOOM_DRAFT_OSV_DIR")
         if offline:
             return self._query_offline_versions(offline, pkg, versions, diagnostics if diagnostics is not None else {},
-                                                excluded_public_version)
+                                                excluded_public_version, public_fallback)
         if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
             approved_registry = os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE")
             if approved_registry:
@@ -5537,7 +5544,7 @@ def analyze_project(
             osv_candidates = [version for version in osv_candidates if version != current]
         try:
             vulns = client.query_osv_versions(name, osv_candidates, progress_label=dependency_label,
-                                             **({"diagnostics": diagnostics} if offline_query else {}),
+                                             **({"diagnostics": diagnostics, "public_fallback": True} if offline_query else {}),
                                              **({"excluded_public_version": excluded_public_version}
                                                 if excluded_public_version is not None else {}))
         except VulnerabilityEvidenceUnavailable as exc:
@@ -24674,7 +24681,9 @@ def enrich_final_registry_security(
         for pkg, version in missing:
             diagnostics = {}
             try:
-                assessed[pkg, version] = client.query_osv_versions(pkg, [version], diagnostics=diagnostics)[version]
+                candidate_only = all(row.current_version != version for row in missing[pkg, version])
+                assessed[pkg, version] = client.query_osv_versions(
+                    pkg, [version], diagnostics=diagnostics, public_fallback=candidate_only)[version]
             except VulnerabilityEvidenceUnavailable:
                 pass
             for row in missing[pkg, version]:
@@ -26399,7 +26408,9 @@ def _build_draft_execution_context(
     if registry:
         ctx.setdefault("registry", _sanitize_registry_url(registry))
         if os.environ.get("DEPLOOM_DRAFT_OSV_DIR"):
-            ctx["registryFallbackEnabled"] = _corporate_advisory_fallback(registry)
+            ctx["registryFallbackEnabled"] = (_corporate_advisory_fallback(registry) or
+                                              (registry.rstrip("/") == PUBLIC_NPM_REGISTRY and
+                                               os.environ.get("DEPLOOM_DRAFT_PUBLIC_ADVISORY_FALLBACK") == "1"))
     if input_hashes:
         ctx.setdefault("inputHashes", input_hashes)
     if artifacts_dir is not None:
