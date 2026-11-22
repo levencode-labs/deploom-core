@@ -6,6 +6,10 @@ import re
 PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org"
 
 
+class AdvisoryOnlyPackument(dict):
+    """Fresh anonymous public response with a refused cookie. Never persist as identity evidence."""
+
+
 def published_version(packument, name, version):
     if packument.get("name") != name:
         return None

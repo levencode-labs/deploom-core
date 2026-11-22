@@ -161,7 +161,7 @@ class OfflineEvidenceTests(unittest.TestCase):
             def query(**kwargs):
                 return client.query_osv_versions(name, [version, "8.8.8", "latest"], diagnostics={}, **kwargs)
             self.assertEqual(query(public_fallback=True), {version: []})
-            bulk.assert_called_once_with([(name, version)], registry)
+            bulk.assert_called_once_with([(name, version)], registry, anonymous_public=True)
             bulk.reset_mock()
             with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
                 query(public_fallback=True, excluded_public_version=version)
