@@ -1,0 +1,33 @@
+name: Deploom D original hero capture (design branch only)
+on:
+  push:
+    branches:
+      - design/deploom-d-continuous-hero
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Save exact original hero files (read-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p original-heroes
+          cp assets/product-hero.jpg original-heroes/core.jpg
+          curl --fail --location --retry 3 --silent --show-error \
+            https://raw.githubusercontent.com/levencode-labs/deploom-mcp/main/assets/product-hero.jpg \
+            -o original-heroes/mcp.jpg
+          curl --fail --location --retry 3 --silent --show-error \
+            https://raw.githubusercontent.com/levencode-labs/deploom-npm/main/assets/product-hero.jpg \
+            -o original-heroes/npm.jpg
+          sha256sum original-heroes/*.jpg > original-heroes/SHA256SUMS
+          file original-heroes/*.jpg
+          cat original-heroes/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deploom-original-hero-binaries
+          path: original-heroes/
+          if-no-files-found: error
