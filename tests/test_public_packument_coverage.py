@@ -114,6 +114,20 @@ class PublicPackumentCoverageTests(unittest.TestCase):
         self.assertNotIn("headers", self.read(updated, self.response()))
         self.assertEqual(self.coverage(updated)[self.version]["findingCount"], 0)
 
+    def test_cookie_response_is_ephemeral_and_requires_explicit_public_cache_control(self):
+        with patch.dict(os.environ, {"DEPLOOM_DRAFT_PUBLIC_ADVISORY_FALLBACK": "1"}):
+            client = self.client()
+        for control, expected in (("public, max-age=300", core.AdvisoryOnlyPackument),
+                                  ("private, public", dict), ("no-store", dict), ("", dict)):
+            with self.subTest(control=control):
+                response = self.response()
+                response.headers.update({"Set-Cookie": "fixture=offered", "Cache-Control": control})
+                with core._stateless_npm_session() as isolated, patch.object(core, "_stateless_npm_session", return_value=isolated), patch.object(isolated, "get", return_value=response) as get:
+                    self.assertIs(type(client.fetch_npm_metadata(self.name)), expected)
+                    self.assertFalse(get.call_args.kwargs["allow_redirects"])
+                self.assertNotIn(self.name, client.npm_cache)
+                self.assertFalse(any((self.root / "cache").rglob("*.json")))
+
     def test_untrusted_transport_never_establishes_identity(self):
         for condition in ("redirect", "mirror", "sent-cookie", "cookie", "auth", "env", "proxy", "missing-request",
                           "private-response", "credential-on-request"):

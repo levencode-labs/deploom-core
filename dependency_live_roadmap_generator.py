@@ -66,6 +66,8 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
+from contextlib import nullcontext
+from http.cookiejar import DefaultCookiePolicy
 from urllib.parse import urlparse, urljoin, quote
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -158,7 +160,7 @@ from constraint_cache import (
 )
 from copy import copy as shallow_copy
 from registry_request_context import request_context
-from public_npm_identity import PUBLIC_NPM_REGISTRY, matches_lock, published_version
+from public_npm_identity import PUBLIC_NPM_REGISTRY, AdvisoryOnlyPackument, matches_lock, published_version
 from registry_metadata_cache import (
     DEFAULT_METADATA_CACHE_TTL_SECONDS,
     DirectRegistryPackument,
@@ -2423,6 +2425,13 @@ def _corporate_advisory_fallback(registry):
                 os.environ.get("DEPLOOM_DRAFT_CORPORATE_ADVISORY_SOURCE", "")))
 
 
+def _stateless_npm_session():
+    session = requests.Session()
+    session.trust_env = False
+    session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=()))
+    return session
+
+
 class LiveDataClient:
     def __init__(
         self,
@@ -2453,6 +2462,8 @@ class LiveDataClient:
         # inherit system proxy settings; opt in with --use-system-proxy or
         # useSystemProxy=true when the environment actually requires it.
         self.session.trust_env = use_system_proxy
+        self.stateless_public_advisories = (self.registry == PUBLIC_NPM_REGISTRY and not use_system_proxy
+                                           and os.environ.get("DEPLOOM_DRAFT_PUBLIC_ADVISORY_FALLBACK") == "1")
         # Keep cache attributes unannotated: some IDE/type-checker setups used by
         # contributors report false-positive "Invalid type argument" diagnostics
         # on nested typing aliases here. The runtime contract is still documented
@@ -3109,26 +3120,30 @@ class LiveDataClient:
         for attempt in range(1, REGISTRY_METADATA_MAX_ATTEMPTS + 1):
             try:
                 self.progress(operation="registry metadata", package=pkg, retry=attempt - 1, step="scan")
-                response = self._supervised(
-                    lambda url=url: self.session.get(url, timeout=self._budgeted_timeout(), stream=True,
-                                                     **({"headers": conditional} if conditional else {}),
-                                                     **({} if self.allow_registry_metadata_redirects else {"allow_redirects": False}))
-                )
+                isolated = self.stateless_public_advisories and durable
+                def get_metadata():
+                    with _stateless_npm_session() if isolated else nullcontext(self.session) as session:
+                        return session.get(url, timeout=self._budgeted_timeout(), stream=True,
+                                           **({"headers": conditional} if conditional else {}),
+                                           **({"allow_redirects": False} if isolated or not self.allow_registry_metadata_redirects else {}))
+                response = self._supervised(get_metadata)
                 hops = (*getattr(response, "history", ()), response)
-                reusable = (durable and self.metadata_request_context() == (context, True)
-                            and not any(
-                                key.lower() == "set-cookie"
-                                or (key.lower() == "vary" and any(token.strip() == "*" for token in value.split(",")))
-                                or (key.lower() == "cache-control" and any(
-                                    directive.strip().partition("=")[0].strip().lower() in {"private", "no-store", "no-cache"}
-                                    for directive in value.split(",")
-                                ))
-                                for hop in hops for key, value in getattr(hop, "headers", {}).items()
-                            ))
+                anonymous = durable and self.metadata_request_context() == (context, True)
+                headers = [(k.lower(), v) for hop in hops for k, v in getattr(hop, "headers", {}).items()]
+                cookie_offered = any(key == "set-cookie" for key, _ in headers)
+                shareable = not any(
+                    (key == "vary" and any(token.strip() == "*" for token in value.split(",")))
+                    or (key == "cache-control" and any(
+                        d.strip().partition("=")[0].strip().lower() in {"private", "no-store", "no-cache"}
+                        for d in value.split(",")))
+                    for key, value in headers)
+                reusable = anonymous and shareable and not cookie_offered
+                ephemeral = (isolated and anonymous and shareable and cookie_offered
+                             and "public" in {d.strip().lower() for d in response.headers.get("Cache-Control", "").split(",")})
                 status = int(getattr(response, "status_code", 0) or 0)
                 prepared = getattr(response, "request", None)
                 sent_headers = getattr(prepared, "headers", None)
-                direct_public = (reusable and self.registry == PUBLIC_NPM_REGISTRY
+                direct_public = ((reusable or ephemeral) and self.registry == PUBLIC_NPM_REGISTRY
                                  and getattr(response, "history", None) == [] and getattr(response, "url", None) == url
                                  and getattr(prepared, "method", None) == "GET" and getattr(prepared, "url", None) == url
                                  and isinstance(sent_headers, Mapping)
@@ -3167,7 +3182,7 @@ class LiveDataClient:
                 if not valid_registry_packument_shape(data):
                     raise ValueError("registry packument has invalid versions/dist-tags/time/dist shape")
                 if direct_public and status == 200 and data.get("name") == pkg:
-                    data = DirectRegistryPackument(data)
+                    data = AdvisoryOnlyPackument(data) if ephemeral else DirectRegistryPackument(data)
                 if not durable or reusable:
                     self.npm_cache[pkg] = data
                 if reusable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
@@ -3212,7 +3227,7 @@ class LiveDataClient:
 
     def query_registry_advisory_evidence(
         self, pairs: List[Tuple[str, str]], approved_registry: str, *,
-        max_match_evaluations: int | None = None,
+        max_match_evaluations: int | None = None, anonymous_public: bool = False,
     ):
         from npm_semver_batch import match_npm_semver_many
         from registry_advisory_evidence import RegistryAdvisoryEvidence, query_registry_advisories
@@ -3235,11 +3250,14 @@ class LiveDataClient:
                 comparisons, timeout_seconds=timeout[1] if isinstance(timeout, tuple) else timeout,
             )
 
-        evidence = self._supervised(lambda: query_registry_advisories(
-            self.session, self.registry, approved_registry, permitted,
-            match_many=match_many, timeout=self._budgeted_timeout(),
-            max_match_evaluations=max_match_evaluations,
-        ))
+        def query():
+            with _stateless_npm_session() if anonymous_public else nullcontext(self.session) as session:
+                return query_registry_advisories(
+                    session, self.registry, approved_registry, permitted,
+                    match_many=match_many, timeout=self._budgeted_timeout(),
+                    max_match_evaluations=max_match_evaluations,
+                )
+        evidence = self._supervised(query)
         return {**blocked, **evidence}
 
     def _query_registry_security_pairs(
@@ -3263,14 +3281,14 @@ class LiveDataClient:
             raise VulnerabilityEvidenceUnavailable("REGISTRY_ADVISORY_EVIDENCE_UNAVAILABLE")
         return {version: assessed[pkg, version] for version in versions}
 
-    def _query_offline_versions(self, offline, pkg, versions, diagnostics, excluded_public_version, public_fallback):
+    def _query_offline_versions(self, offline, pkg, versions, diagnostics, excluded_public_version, public_fallback, advisory_metadata):
         assessments = osv_offline.assess(offline, pkg, versions,
                                          os.environ.get("DEPLOOM_DRAFT_PRIVATE_SCOPES", ""),
                                          os.environ.get("DEPLOOM_DRAFT_PUBLIC_NAMES", ""))
-        meta = self.npm_cache.get(pkg)
+        meta = advisory_metadata if isinstance(advisory_metadata, AdvisoryOnlyPackument) else self.npm_cache.get(pkg)
         public_versions = set()
         public_gaps = []
-        if (isinstance(meta, DirectRegistryPackument) and self.registry == PUBLIC_NPM_REGISTRY
+        if (isinstance(meta, (DirectRegistryPackument, AdvisoryOnlyPackument)) and self.registry == PUBLIC_NPM_REGISTRY
                 and self.metadata_request_context() == (self._metadata_request_context, True)):
             for version, assessment in assessments.items():
                 if (not assessment.reason or _private_package(pkg) or not osv_offline.is_exact_version(version)
@@ -3278,7 +3296,7 @@ class LiveDataClient:
                     continue
                 if version == excluded_public_version:
                     assessment.reason = "LOCKED_PUBLIC_ARTIFACT_UNCONFIRMED"
-                elif assessment.reason == "PUBLIC_PACKAGE_UNCONFIRMED":
+                elif assessment.reason == "PUBLIC_PACKAGE_UNCONFIRMED" and isinstance(meta, DirectRegistryPackument):
                     assessments[version] = osv_offline.PairAssessment()
                     public_versions.add(version)
                 elif public_fallback and os.environ.get("DEPLOOM_DRAFT_PUBLIC_ADVISORY_FALLBACK") == "1":
@@ -3289,7 +3307,7 @@ class LiveDataClient:
         if missing and _corporate_advisory_fallback(self.registry):
             fallback = self.query_registry_advisory_evidence(missing, self.registry)
         elif public_gaps:
-            fallback = self.query_registry_advisory_evidence(public_gaps, PUBLIC_NPM_REGISTRY)
+            fallback = self.query_registry_advisory_evidence(public_gaps, PUBLIC_NPM_REGISTRY, anonymous_public=True)
         results = {}
         for version, assessment in assessments.items():
             source = "OFFLINE_OSV_NPM"
@@ -3327,11 +3345,12 @@ class LiveDataClient:
         diagnostics: Optional[Dict[str, Dict[str, Any]]] = None,
         excluded_public_version: Optional[str] = None,
         public_fallback: bool = False,
+        advisory_metadata=None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         offline = os.environ.get("DEPLOOM_DRAFT_OSV_DIR")
         if offline:
             return self._query_offline_versions(offline, pkg, versions, diagnostics if diagnostics is not None else {},
-                                                excluded_public_version, public_fallback)
+                                                excluded_public_version, public_fallback, advisory_metadata)
         if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
             approved_registry = os.environ.get("DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE")
             if approved_registry:
@@ -5532,7 +5551,7 @@ def analyze_project(
         diagnostics = {}
         offline_query = isinstance(client, LiveDataClient) and os.environ.get("DEPLOOM_DRAFT_OSV_DIR")
         excluded_public_version = None
-        if offline_query and lock and isinstance(meta, DirectRegistryPackument):
+        if offline_query and lock and isinstance(meta, (DirectRegistryPackument, AdvisoryOnlyPackument)):
             if public_lock_records is None:
                 public_lock_records = direct_public_lock_records(project.path, lock, dependencies)
             if not matches_lock(meta, name, current, public_lock_records.get((name, spec)),
@@ -5544,7 +5563,7 @@ def analyze_project(
             osv_candidates = [version for version in osv_candidates if version != current]
         try:
             vulns = client.query_osv_versions(name, osv_candidates, progress_label=dependency_label,
-                                             **({"diagnostics": diagnostics, "public_fallback": True} if offline_query else {}),
+                                             **({"diagnostics": diagnostics, "public_fallback": True, "advisory_metadata": meta} if offline_query else {}),
                                              **({"excluded_public_version": excluded_public_version}
                                                 if excluded_public_version is not None else {}))
         except VulnerabilityEvidenceUnavailable as exc:
