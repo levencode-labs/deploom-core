@@ -177,6 +177,33 @@ class OfflineEvidenceTests(unittest.TestCase):
                 self.assertEqual(query(public_fallback=True), {version: []})
             bulk.assert_not_called()
 
+    def test_corporate_omission_only_for_confirmed_registry_version(self):
+        import dependency_live_roadmap_generator as core
+        from unittest.mock import MagicMock
+        registry = "https://registry.example.test/npm"
+        name = "@team/sample"
+        version = "1.0.0"
+        client = core.LiveDataClient(registry, timeout=2, batch_size=8, sleep_sec=0)
+        self.addCleanup(client.session.close)
+        client.npm_cache[name] = {"name": name, "versions": {version: {"name": name, "version": version,
+            "dist": {"tarball": registry + "/@team/sample/-/sample-1.0.0.tgz"}}}}
+        client.session.post = MagicMock()
+        response = client.session.post.return_value.__enter__.return_value
+        response.status_code = 200
+        response.iter_content.return_value = [b"{}"]
+        env = {"DEPLOOM_DRAFT_OSV_DIR": str(self.root), "DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE": "1",
+               "DEPLOOM_DRAFT_REGISTRY_ADVISORY_SOURCE": registry, "DEPLOOM_DRAFT_CORPORATE_ADVISORY_SOURCE": registry,
+               "DEPLOOM_DRAFT_PRIVATE_SCOPES": "@team"}
+        with patch.dict(os.environ, env):
+            diagnostics = {}
+            self.assertEqual(client.query_osv_versions(name, [version, "2.0.0"], diagnostics=diagnostics), {version: []})
+            self.assertEqual(diagnostics[version]["source"], "REGISTRY_BULK_ADVISORY")
+            self.assertEqual(diagnostics[version]["findingCount"], 0)
+            self.assertEqual(diagnostics["2.0.0"]["registryReason"], "COVERAGE_UNCONFIRMED")
+            response.status_code = 503
+            with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                client.query_osv_versions(name, [version])
+
     def test_offline_names_never_reach_public_or_unapproved_endpoints(self):
         import dependency_live_roadmap_generator as core
         registry = "https://example.test/corporate"

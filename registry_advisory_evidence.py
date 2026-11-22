@@ -102,6 +102,7 @@ def query_registry_advisories(
     match_many: Callable[[list[tuple[str, str]]], list[bool | None]] | None = None,
     timeout: tuple[float, float],
     trust_omitted_packages: bool = False,
+    confirmed_omissions: frozenset[tuple[str, str]] = frozenset(),
     max_match_evaluations: int | None = None,
 ) -> dict[tuple[str, str], RegistryAdvisoryEvidence]:
     """Query one trusted registry. The host supplies approval and omission policy.
@@ -167,7 +168,7 @@ def query_registry_advisories(
     for name, version in requested:
         pair = name, version
         records = data.get(name)
-        if name not in data and not trust_omitted_packages:
+        if name not in data and not trust_omitted_packages and pair not in confirmed_omissions:
             record_unknown(pair, "COVERAGE_UNCONFIRMED")
             continue
         try:
@@ -226,6 +227,7 @@ def query_registry_advisories(
         matched = tuple(dict.fromkeys(record for record in records if comparisons[record.vulnerable_range, version]))
         evidence[name, version] = RegistryAdvisoryEvidence(
             "AFFECTED" if matched else "NO_REPORTED_ADVISORIES",
-            "REGISTRY_EXACT_VERSION", matched, digest, timestamp,
+            "REGISTRY_NO_REPORTED_ADVISORIES" if name not in data and (name, version) in confirmed_omissions
+            else "REGISTRY_EXACT_VERSION", matched, digest, timestamp,
         )
     return {pair: evidence[pair] for pair in requested}
