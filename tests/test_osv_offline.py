@@ -141,6 +141,42 @@ class OfflineEvidenceTests(unittest.TestCase):
             response.iter_content.return_value = [b'{"missing":[]}']
             self.assertEqual(client.query_osv_versions("missing", ["2.0.0"]), {"2.0.0": []})
 
+    def test_public_fallback_requires_proven_exact_pair_and_only_fills_gaps(self):
+        import dependency_live_roadmap_generator as core
+        from registry_advisory_evidence import RegistryAdvisoryEvidence
+
+        name, version = "lodash", "4.17.20"
+        registry = core.PUBLIC_NPM_REGISTRY
+        client = core.LiveDataClient(registry, timeout=2, batch_size=10, sleep_sec=0)
+        self.addCleanup(client.session.close)
+        meta = core.DirectRegistryPackument(name=name, versions={version: {
+            "name": name, "version": version, "dist": {"tarball": f"{registry}/{name}/-/{name}-{version}.tgz"}}})
+        client.npm_cache[name] = meta
+        env = {"DEPLOOM_DRAFT_OSV_DIR": str(self.root / "absent"),
+               "DEPLOOM_DRAFT_PUBLIC_ADVISORY_FALLBACK": "1"}
+        reply = {(name, version): RegistryAdvisoryEvidence("NO_REPORTED_ADVISORIES", "REGISTRY_EXACT_VERSION")}
+        with patch.dict(os.environ, env), patch.object(client, "metadata_request_context",
+                return_value=(client._metadata_request_context, True)), patch.object(
+                client, "query_registry_advisory_evidence", return_value=reply) as bulk:
+            def query(**kwargs):
+                return client.query_osv_versions(name, [version, "8.8.8", "latest"], diagnostics={}, **kwargs)
+            self.assertEqual(query(public_fallback=True), {version: []})
+            bulk.assert_called_once_with([(name, version)], registry)
+            bulk.reset_mock()
+            with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                query(public_fallback=True, excluded_public_version=version)
+            with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                query()
+            with patch.dict(os.environ, {"DEPLOOM_DRAFT_PRIVATE_SCOPES": name}):
+                with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                    query(public_fallback=True)
+            with patch.dict(client.npm_cache, {name: dict(meta)}):
+                with self.assertRaises(core.VulnerabilityEvidenceUnavailable):
+                    query(public_fallback=True)
+            with patch.dict(os.environ, {"DEPLOOM_DRAFT_OSV_DIR": str(self.root)}):
+                self.assertEqual(query(public_fallback=True), {version: []})
+            bulk.assert_not_called()
+
     def test_offline_names_never_reach_public_or_unapproved_endpoints(self):
         import dependency_live_roadmap_generator as core
         registry = "https://example.test/corporate"
