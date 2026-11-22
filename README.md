@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/social-preview.png" width="768" alt="Deploom Core banner" />
+<img src="assets/product-hero.jpg" width="1200" alt="Levencode Labs Deploom Core — dependency planning, explicit constraints and evidence" />
 
 # Deploom Core
 
