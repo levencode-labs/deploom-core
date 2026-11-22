@@ -3250,11 +3250,20 @@ class LiveDataClient:
                 comparisons, timeout_seconds=timeout[1] if isinstance(timeout, tuple) else timeout,
             )
 
+        confirmed = set()
+        if not anonymous_public and _corporate_advisory_fallback(self.registry):
+            for name, version in permitted:
+                meta = self.npm_cache.get(name) or {}
+                entry = (meta.get("versions") or {}).get(version) or {}
+                if (meta.get("name") == name and entry.get("name") == name and entry.get("version") == version
+                        and self.registry_artifact_url_allowed(self.registry_tarball_url(meta, version))):
+                    confirmed.add((name, version))
+
         def query():
             with _stateless_npm_session() if anonymous_public else nullcontext(self.session) as session:
                 return query_registry_advisories(
                     session, self.registry, approved_registry, permitted,
-                    match_many=match_many, timeout=self._budgeted_timeout(),
+                    match_many=match_many, timeout=self._budgeted_timeout(), confirmed_omissions=frozenset(confirmed),
                     max_match_evaluations=max_match_evaluations,
                 )
         evidence = self._supervised(query)
@@ -3317,6 +3326,9 @@ class LiveDataClient:
             if assessment.reason:
                 evidence["osvReason"] = assessment.reason
             record = fallback.get((pkg, version))
+            if (record is not None and record.reason == "REGISTRY_NO_REPORTED_ADVISORIES"
+                    and assessment.reason in {"UNSUPPORTED_OSV_RANGE", "MISSING_SEVERITY"}):
+                record = None
             if record is not None:
                 evidence["registryReason"] = record.reason
                 if record.status in {"AFFECTED", "NO_REPORTED_ADVISORIES"}:
