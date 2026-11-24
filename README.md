@@ -14,6 +14,23 @@ Deploom Core is a headless Python engine for planning dependency upgrades in Jav
 
 **Core creates plans. It does not automatically prove that an npm installation, an application's tests, or runtime behavior will succeed.**
 
+## Quick start
+
+For an application migration, start with the [npm installer and walkthrough](https://github.com/levencode-labs/deploom-npm#quick-start). DepLoom MCP supplies Core automatically.
+
+### Check the engine from source
+
+Supported Core Python range: **3.12–3.13** (`>=3.12,<3.14`). From a clean checkout:
+
+```sh
+python -m venv .venv
+python -m pip install -e .
+python dependency_live_roadmap_generator.py --help
+python -m unittest discover -s tests -p 'test_required_planner.py' -v
+```
+
+Use the interpreter from your virtual environment if `python` resolves elsewhere. The [CI workflow](.github/workflows/ci.yml) and [testing notes](docs/TESTING.md) describe which tests are covered; a green lightweight suite is not a full migration acceptance.
+
 ## What it does
 
 - Proposes version candidates within selected scope and approved version lines.
@@ -42,19 +59,6 @@ Developer / coding agent
 ```
 
 [Deploom MCP](https://github.com/levencode-labs/deploom-mcp) is the user-facing agent integration and includes a pinned copy of Core in its published wheel. You do not need to install Core separately to run that wheel.
-
-## Local development
-
-Supported Core Python range: **3.12–3.13** (`>=3.12,<3.14`). From a clean checkout:
-
-```sh
-python -m venv .venv
-python -m pip install -e .
-python dependency_live_roadmap_generator.py --help
-python -m unittest discover -s tests -p 'test_required_planner.py' -v
-```
-
-Use the interpreter from your virtual environment if `python` resolves elsewhere. The [CI workflow](.github/workflows/ci.yml) and [testing notes](docs/TESTING.md) describe which tests are covered; a green lightweight suite is not a full migration acceptance.
 
 ## Documentation
 
