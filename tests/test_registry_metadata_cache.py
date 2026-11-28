@@ -42,7 +42,7 @@ def _stub_server(packument, unknown_paths=()):
                 self.send_response(404)
                 self.end_headers()
                 return
-            body = json.dumps(packument).encode("utf-8")
+            body = json.dumps({**packument, "name": path}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -203,7 +203,7 @@ class RegistryMetadataCacheClientTests(unittest.TestCase):
                 visits.append((self.path, validator))
                 if self.path == "/redirect":
                     self.send_response(302)
-                    self.send_header("Location", "/pkg-a")
+                    self.send_header("Location", "/mirror/redirect")
                     self.end_headers()
                     return
                 if validator == '"fixture"' or self.path == "/unbound":
@@ -213,7 +213,7 @@ class RegistryMetadataCacheClientTests(unittest.TestCase):
                 self.send_response(200)
                 self.send_header("ETag", '"fixture"')
                 self.end_headers()
-                self.wfile.write(json.dumps(PACKUMENT).encode())
+                self.wfile.write(json.dumps({**PACKUMENT, "name": self.path.rsplit("/", 1)[-1]}).encode())
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -225,10 +225,10 @@ class RegistryMetadataCacheClientTests(unittest.TestCase):
             other_query_cache = root / "query-cache"
             registry = _registry_url(server)
             with patch.dict(os.environ, {"DEPLOOM_PLANNING_CACHE_DIR": str(other_query_cache)}):
-                self.assertEqual(_client(registry, cache_dir).fetch_npm_metadata("redirect"), PACKUMENT)
+                self.assertEqual(_client(registry, cache_dir).fetch_npm_metadata("redirect"), {**PACKUMENT, "name": "redirect"})
                 with self.assertRaises(roadmap.RegistryInfrastructureError):
                     _client(registry, cache_dir, redirects=False).fetch_npm_metadata("redirect")
-                self.assertEqual(visits, [("/redirect", None), ("/pkg-a", None), ("/redirect", None)])
+                self.assertEqual(visits, [("/redirect", None), ("/mirror/redirect", None), ("/redirect", None)])
 
                 with self.assertRaises(roadmap.RegistryInfrastructureError):
                     _client(registry, cache_dir, redirects=False).fetch_npm_metadata("unbound")
@@ -268,7 +268,7 @@ class RegistryMetadataCacheClientTests(unittest.TestCase):
                 self.send_response(200)
                 self.send_header(*cases[name])
                 self.end_headers()
-                self.wfile.write(json.dumps(PACKUMENT).encode())
+                self.wfile.write(json.dumps({**PACKUMENT, "name": name}).encode())
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -280,7 +280,7 @@ class RegistryMetadataCacheClientTests(unittest.TestCase):
             for name in cases:
                 for _ in range(2):
                     with self.subTest(name=name):
-                        self.assertEqual(_client(registry, cache, redirects=False).fetch_npm_metadata(name), PACKUMENT)
+                        self.assertEqual(_client(registry, cache, redirects=False).fetch_npm_metadata(name), {**PACKUMENT, "name": name})
             self.assertCountEqual(requests, [name for name in cases for _ in range(2)])
             self.assertEqual(list(cache.rglob("*.json")), [])
 
