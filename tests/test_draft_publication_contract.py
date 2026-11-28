@@ -9,6 +9,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import dependency_live_roadmap_generator as roadmap
 
@@ -59,7 +60,8 @@ class DraftPublicationContractTests(unittest.TestCase):
         roadmap._ARTIFACTS_BASE_FOR_DRAFT = self.old_artifacts_base
 
     def _publish(self, run_id: str, *, status: str = "DRAFT_READY",
-                 input_hashes: dict[str, str] | None = None) -> dict:
+                 input_hashes: dict[str, str] | None = None,
+                 deadline: roadmap.DeadlineClock | None = None) -> dict:
         return roadmap.publish_draft_result(
             run_id=run_id,
             workspace_id="ws-test",
@@ -70,7 +72,7 @@ class DraftPublicationContractTests(unittest.TestCase):
             health_by_project={"tiny-basic": unknown_health()},
             status=status,
             partial_reason=("synthetic deadline" if status == "DRAFT_PARTIAL" else None),
-            deadline=roadmap.DeadlineClock(None),
+            deadline=deadline if deadline is not None else roadmap.DeadlineClock(None),
             input_hashes=input_hashes,
         )
 
@@ -151,8 +153,8 @@ class DraftPublicationContractTests(unittest.TestCase):
 
     def test_deadline_budget_has_explicit_phase_and_disabled_state(self) -> None:
         clock = roadmap.DeadlineClock(0.001)
-        # Do not sleep 10 ms: coarse monotonic timer granularity on Windows
-        # can leave the clock unexpired. Move only the synthetic start point.
+        # Move only the synthetic start point, avoiding wall-clock sleeps and
+        # scheduler timing in this deadline-state contract.
         clock.started -= 1.0
         with self.assertRaises(roadmap.DraftBudgetExceeded) as caught:
             clock.check("synthetic-phase")
@@ -162,6 +164,20 @@ class DraftPublicationContractTests(unittest.TestCase):
         snapshot = disabled.as_dict()
         self.assertIsNone(snapshot["deadlineSeconds"])
         self.assertIsNone(snapshot["remainingMs"])
+
+    def test_elapsed_publication_uses_one_clock_when_clock_origins_differ(self) -> None:
+        now = [1000.0]
+        with (tempfile.TemporaryDirectory() as temporary,
+              patch.object(roadmap.time, "monotonic", return_value=100.0),
+              patch.object(roadmap.time, "perf_counter", side_effect=lambda: now[0])):
+            roadmap.set_draft_artifacts_base(Path(temporary))
+            clock = roadmap.DeadlineClock(10.0)
+            now[0] = 1002.5
+            manifest = self._publish("run-clock-origin", deadline=clock)
+            self.assertEqual(2500, manifest["elapsedMs"])
+            self.assertEqual(7500, manifest["deadline"]["remainingMs"])
+            persisted = json.loads((Path(temporary) / "runs/run-clock-origin/draft/result.json").read_bytes())
+            self.assertEqual(2500, persisted["elapsedMs"])
 
 
 if __name__ == "__main__":
