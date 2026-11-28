@@ -24312,17 +24312,25 @@ class DeadlineClock:
     ``deadline_seconds=None`` disables enforcement (used by non-draft modes
     and by tests that drive their own clock). The deadline is created once at
     run acceptance and is never reset between phases/variants.
+
+    Use the high-resolution monotonic performance counter. On Windows with
+    CPython 3.12, ``time.monotonic`` has 15.6 ms ticks, which can hide the end
+    of a fractional request budget after its socket timeout has already fired.
     """
 
     def __init__(self, deadline_seconds: Optional[float]) -> None:
         self.deadline_seconds = deadline_seconds
-        self.started = time.monotonic()
+        self.started = time.perf_counter()
+
+    @property
+    def elapsed(self) -> float:
+        return max(0.0, time.perf_counter() - self.started)
 
     @property
     def remaining(self) -> Optional[float]:
         if self.deadline_seconds is None:
             return None
-        return max(0.0, self.deadline_seconds - (time.monotonic() - self.started))
+        return max(0.0, self.deadline_seconds - self.elapsed)
 
     def check(self, phase: str) -> None:
         if self.remaining is not None and self.remaining <= 0:
@@ -24377,6 +24385,9 @@ def run_supervised(phase: str, deadline: Optional[DeadlineClock], fn: Any) -> An
     thread.join(timeout=budget)
     if thread.is_alive():
         raise DraftBudgetExceeded(phase)
+    # Completion and timeout can race. A finished worker's result or exception
+    # is acceptable only while the absolute publication reserve is still intact.
+    deadline.check_with_reserve(phase)
     if "exc" in box:
         raise box["exc"]
     return box["value"]
@@ -24426,6 +24437,9 @@ def run_supervised_planning(
     thread.join(timeout=budget)
     if thread.is_alive():
         raise DraftBudgetExceeded(phase)
+    # Keep deadline priority for completed errors too. The second check below
+    # still protects publication from time consumed by copying accepted rows.
+    deadline.check_with_reserve(phase)
     if "exc" in box:
         raise box["exc"]
     accepted = copy.deepcopy(working)
@@ -26851,7 +26865,7 @@ def publish_draft_result(
         "projectId": project_id,
         "mode": mode,
         "generatedAt": generated_at,
-        "elapsedMs": int((time.monotonic() - deadline.started) * 1000),
+        "elapsedMs": int(deadline.elapsed * 1000),
         "deadline": deadline.as_dict(),
         "policyHash": policy_hash,
         "decisionContract": contract,

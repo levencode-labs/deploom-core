@@ -22,7 +22,7 @@ class DraftPlanningDeadlineTests(unittest.TestCase):
             now[0] = 10.0
             return copy_rows(value)
 
-        with patch.object(roadmap.time, "monotonic", side_effect=lambda: now[0]):
+        with patch.object(roadmap.time, "perf_counter", side_effect=lambda: now[0]):
             clock = roadmap.DeadlineClock(10.0)
             with (patch.object(roadmap.copy, "deepcopy", side_effect=expensive_copy),
                   patch.object(roadmap, "stable_sha256_text") as worker):
@@ -44,7 +44,7 @@ class DraftPlanningDeadlineTests(unittest.TestCase):
         def worker(working):
             working["fixture"][:] = ["changed"]
 
-        with patch.object(roadmap.time, "monotonic", side_effect=lambda: now[0]):
+        with patch.object(roadmap.time, "perf_counter", side_effect=lambda: now[0]):
             clock = roadmap.DeadlineClock(10.0)
             with patch.object(roadmap.copy, "deepcopy", side_effect=copy_with_cost):
                 with self.assertRaises(roadmap.DraftBudgetExceeded):
