@@ -6,6 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlsplit
 import dependency_live_roadmap_generator as roadmap
 from registry_metadata_cache import load_packument, store_packument
 
@@ -70,16 +71,18 @@ class RegistryContextBoundaryTests(unittest.TestCase):
 
     def test_authenticated_fetch_and_parallel_prefetch_keep_the_callers_view(self):
         principals = []
+        request_paths = []
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_): pass
             def do_GET(self):
                 principal = self.headers.get('Authorization')
                 principals.append(principal)
+                request_paths.append(self.path)
                 if not principal:
                     self.send_response(401); self.end_headers(); return
                 version = '1.0.0' if principal == 'fixture-a' else '2.0.0'
                 self.send_response(200); self.end_headers()
-                self.wfile.write(json.dumps({'name': self.path, 'dist-tags': {'latest': version}, 'versions': {version: {}}}).encode())
+                self.wfile.write(json.dumps({'name': urlsplit(self.path).path.lstrip('/'), 'dist-tags': {'latest': version}, 'versions': {version: {}}}).encode())
         server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         try:
@@ -93,7 +96,9 @@ class RegistryContextBoundaryTests(unittest.TestCase):
                 self.assertEqual(client.fetch_npm_metadata('a')['dist-tags']['latest'], '2.0.0')
                 roadmap._prefetch_registry_metadata(client, [('b', 'runtime', '^1.0.0'), ('c', 'runtime', '^1.0.0')], max_workers=2)
                 self.assertTrue(all(client.npm_cache[name]['dist-tags']['latest'] == '2.0.0' for name in ('b', 'c')))
-                self.assertEqual(client.npm_cache['b']['name'], '/b?tenant=fixture-tenant')
+                self.assertEqual(client.npm_cache['b']['name'], 'b')
+                self.assertEqual(request_paths[:2], ['/a?tenant=fixture-tenant'] * 2)
+                self.assertCountEqual(request_paths[2:], ['/b?tenant=fixture-tenant', '/c?tenant=fixture-tenant'])
                 self.assertEqual(principals[:2], ['fixture-a', 'fixture-b'])
                 self.assertEqual(principals[2:], ['fixture-b', 'fixture-b'])
                 self.assertEqual(list(Path(raw).rglob('*.json')), [], 'authenticated data must never be persisted')

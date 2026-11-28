@@ -101,6 +101,7 @@ from storybook_release_policy import is_storybook_release_package
 from registry_candidate_diagnostics import (
     summarize_structural_candidates, with_observed_physical_probes,
     no_target_diagnostic_code, safe_registry_artifact_url, valid_registry_packument_shape,
+    registry_packument_error,
     _identity as safe_registry_identity,
 )
 
@@ -689,6 +690,14 @@ def _raise_baseline_human_decision(payload: Mapping[str, object]) -> None:
 
 class RegistryInfrastructureError(RuntimeError):
     """Registry/network uncertainty must never become dependency policy."""
+
+
+class RegistryMetadataError(RegistryInfrastructureError):
+    """A fixed, publishable UNKNOWN reason without untrusted registry values."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(f"{code}: invalid registry response")
 
 
 def _sanitized_baseline_failure_tail(
@@ -3088,7 +3097,7 @@ class LiveDataClient:
             self.npm_cache.clear()
             self._metadata_request_context = context
         if pkg in self.npm_cache:
-            if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg]):
+            if self.npm_cache[pkg] is None or valid_registry_packument_shape(self.npm_cache[pkg], expected_name=pkg):
                 return self.npm_cache[pkg], durable
             self.npm_cache.pop(pkg, None)
         if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
@@ -3098,7 +3107,7 @@ class LiveDataClient:
             cached = load_packument(
                 self.metadata_cache_dir, self.registry, pkg, self.metadata_cache_ttl, context=context or ""
             )
-            if cached is not None and valid_registry_packument_shape(cached):
+            if cached is not None and valid_registry_packument_shape(cached, expected_name=pkg):
                 self.npm_cache[pkg] = cached
                 self._metadata_cache_disk_hits += 1
                 return cached, True
@@ -3107,6 +3116,11 @@ class LiveDataClient:
         encoded = pkg.replace("/", "%2F")
         url = f"{self.registry}/{encoded}"
         stale = load_revalidation_entry(self.metadata_cache_dir, self.registry, pkg, context=context or "") if durable and self.metadata_cache_ttl > 0 else None
+        stale_issue = registry_packument_error(stale["data"], expected_name=pkg) if stale else ""
+        if stale_issue:
+            # Validators for contradictory bytes cannot establish the identity
+            # of the requested package. Recover with an unconditional fetch.
+            stale = None
         if self.registry == PUBLIC_NPM_REGISTRY and stale and "directAnonymousOrigin" not in stale:
             # On normal expiry request the bytes once. A legacy entry carries
             # no record of whether the old request was redirected.
@@ -3152,8 +3166,9 @@ class LiveDataClient:
                 if status == 304 and stale is not None:
                     response.close()
                     data = stale["data"]
-                    if not valid_registry_packument_shape(data):
-                        raise ValueError("304 response has invalid cached registry packument")
+                    issue = registry_packument_error(data, expected_name=pkg)
+                    if issue:
+                        raise RegistryMetadataError(issue)
                     if reusable:
                         # A 304 cannot establish the provenance of previously unmarked bytes.
                         if direct_public and stale.get("directAnonymousOrigin") is True:
@@ -3166,6 +3181,8 @@ class LiveDataClient:
                     return data, reusable
                 if status == 304:
                     response.close()
+                    if stale_issue:
+                        raise RegistryMetadataError(stale_issue)
                     raise ValueError("registry returned 304 without a validated cached subject")
                 if 300 <= status < 400 and not self.allow_registry_metadata_redirects:
                     response.close()
@@ -3179,8 +3196,9 @@ class LiveDataClient:
                     return None, reusable
                 response.raise_for_status()
                 data = self._bounded_json(response)
-                if not valid_registry_packument_shape(data):
-                    raise ValueError("registry packument has invalid versions/dist-tags/time/dist shape")
+                issue = registry_packument_error(data, expected_name=pkg)
+                if issue:
+                    raise RegistryMetadataError(issue)
                 if direct_public and status == 200 and data.get("name") == pkg:
                     data = AdvisoryOnlyPackument(data) if ephemeral else DirectRegistryPackument(data)
                 if not durable or reusable:
@@ -3194,7 +3212,7 @@ class LiveDataClient:
                     )
                 self._bounded_sleep(self.sleep_sec)
                 return data, reusable
-            except DraftBudgetExceeded:
+            except (DraftBudgetExceeded, RegistryMetadataError):
                 raise
             except requests.HTTPError as exc:
                 status = int(getattr(exc.response, "status_code", 0) or 0)
@@ -4993,7 +5011,7 @@ def _prefetch_registry_metadata(
     progress_label: str = "",
     max_workers: int = REGISTRY_PREFETCH_PARALLELISM,
     tolerate: bool = False,
-) -> None:
+) -> Dict[str, RegistryInfrastructureError]:
     """Fetch independent packuments concurrently, then reduce deterministically.
 
     With ``tolerate=True`` (Draft), a failed registry fetch does not abort the
@@ -5002,16 +5020,20 @@ def _prefetch_registry_metadata(
     """
     registry_names = {str(name) for name, _kind, spec in dependencies if not is_non_registry_spec(spec)}
     if not registry_names:
-        return
+        return {}
     context, durable = None, False
     if isinstance(client, LiveDataClient):
         context, durable = client.metadata_request_context()
         if context is None or context != client._metadata_request_context:
             client.npm_cache.clear()
             client._metadata_request_context = context
+    for name in registry_names:
+        cached = client.npm_cache.get(name)
+        if cached is not None and not valid_registry_packument_shape(cached, expected_name=name):
+            client.npm_cache.pop(name, None)
     names = sorted(name for name in registry_names if name not in client.npm_cache)
     if not names:
-        return
+        return {}
     cache_dir = getattr(client, "metadata_cache_dir", None)
     cache_ttl = getattr(client, "metadata_cache_ttl", 0.0) or 0.0
     if durable and cache_dir is not None and cache_ttl > 0:
@@ -5020,7 +5042,7 @@ def _prefetch_registry_metadata(
         missing: List[str] = []
         for name in names:
             cached = load_packument(cache_dir, client.registry, name, cache_ttl, context=context or "")
-            if cached is not None:
+            if cached is not None and valid_registry_packument_shape(cached, expected_name=name):
                 client.npm_cache[name] = cached
             else:
                 missing.append(name)
@@ -5030,24 +5052,26 @@ def _prefetch_registry_metadata(
                 f"[info] {progress_label}: registry metadata served entirely "
                 "from the planning cache"
             )
-            return
+            return {}
     if getattr(client, "deadline", None) is not None:
         # Draft prefetches one window at a time in the deadline-aware row loop.
-        return
+        return {}
     workers = 1 if context is None else max(1, min(int(max_workers), 16, len(names)))
     if workers <= 1:
+        errors = {}
         for name in names:
             try:
                 client.npm_cache[name] = client.fetch_npm_metadata(name)
-            except RegistryInfrastructureError:
+            except RegistryInfrastructureError as exc:
                 if not tolerate:
                     raise
+                errors[name] = exc
                 client.npm_cache[name] = None
                 eprint(
                     f"[warn] {progress_label}: registry metadata unavailable for {name}; "
                     "Draft records the package as unknown instead of failing"
                 )
-        return
+        return errors
 
     started = time.perf_counter()
     local = threading.local()
@@ -5072,16 +5096,22 @@ def _prefetch_registry_metadata(
 
     if errors:
         if tolerate:
+            failures = {}
             for name in names:
                 if name not in results and name in errors:
+                    error = errors[name]
+                    failures[name] = error if isinstance(error, RegistryInfrastructureError) else RegistryInfrastructureError(
+                        "REGISTRY_METADATA_PREFETCH_FAILED")
                     client.npm_cache[name] = None
                     eprint(
                         f"[warn] {progress_label}: registry metadata unavailable for {name}; "
                         "Draft records the package as unknown instead of failing"
                     )
-            return
+            return failures
         first_name = sorted(errors)[0]
         first_error = errors[first_name]
+        if isinstance(first_error, RegistryMetadataError):
+            raise first_error
         raise RegistryInfrastructureError(
             f"REGISTRY_METADATA_PREFETCH_FAILED: {first_name}: {first_error}"
         ) from first_error
@@ -5094,6 +5124,7 @@ def _prefetch_registry_metadata(
         f"packages={len(names)}; parallelism={workers}; "
         f"elapsed={time.perf_counter() - started:.1f}s"
     )
+    return {}
 
 
 OSV_PREFETCH_PARALLELISM = 4
@@ -5255,12 +5286,12 @@ def analyze_project(
         f"[info] {label}: dependency analysis started; direct={len(dependencies)}; "
         f"manager={manager}; lockfile={lock_name}"
     )
-    _prefetch_registry_metadata(
+    metadata_errors = _prefetch_registry_metadata(
         client,
         dependencies,
         progress_label=label,
         tolerate=tolerate_registry_failure,
-    )
+    ) or {}
     try:
         _prefetch_osv_evidence(
             client,
@@ -5281,7 +5312,6 @@ def analyze_project(
 
     draft_prefetch = (tolerate_registry_failure and isinstance(client, LiveDataClient)
                       and client.deadline is not None and client.deadline.remaining is not None)
-    metadata_errors: Dict[str, RegistryInfrastructureError] = {}
     window_end = 0
     for dependency_index, (name, kind, spec) in enumerate(dependencies, start=1):
         if getattr(client, "deadline", None) is not None:
@@ -5398,16 +5428,19 @@ def analyze_project(
         )
         if draft_prefetch and dependency_index > window_end:
             window_end = dependency_index + _DRAFT_METADATA_WINDOW - 1
-            metadata_errors = _prefetch_draft_registry_window(
+            metadata_errors.update(_prefetch_draft_registry_window(
                 client, dependencies[dependency_index - 1:window_end],
-            )
+            ))
+        metadata_failure_reason = "REGISTRY_METADATA_UNAVAILABLE"
         try:
             if name in metadata_errors:
                 raise metadata_errors[name]
             meta = client.fetch_npm_metadata(name)
-        except RegistryInfrastructureError:
+        except RegistryInfrastructureError as exc:
             if not tolerate_registry_failure:
                 raise
+            if isinstance(exc, RegistryMetadataError):
+                metadata_failure_reason = exc.code
             meta = None
             eprint(
                 f"[warn] {dependency_label}: registry metadata unavailable; "
@@ -5428,7 +5461,7 @@ def analyze_project(
                 draft_unknown="registry-failed",
                 current_security_evidence={"status": "UNKNOWN", "reason": (
                     "PRIVATE_METADATA_REGISTRY_UNAPPROVED" if isinstance(client, LiveDataClient) and client._private_metadata_blocked(name)
-                    else "REGISTRY_METADATA_UNAVAILABLE")},
+                    else metadata_failure_reason)},
             )
             if draft_sink is not None:
                 _commit_draft_row(draft_sink, unavailable_row)
