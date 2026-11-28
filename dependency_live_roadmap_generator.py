@@ -191,6 +191,10 @@ from lockfile_consistency import (
 from semantic_version import NpmSpec, Version
 import osv_offline
 from registry_advisory_evidence import corporate_advisory_source_matches, corporate_registry_matches
+from security_evidence import (
+    InvalidOsvEvidence, assess_severity, osv_batch_references, security_goal_satisfied,
+    severity_evidence_diagnostic, valid_osv_id, validate_osv_detail, validate_osv_entries,
+)
 from block_v_predicate_search import prioritize_probe_preference
 from block_psi55_resolver_overrides import (
     propose_duplicate_type_override,
@@ -3389,7 +3393,16 @@ class LiveDataClient:
         if _private_package(pkg):
             raise VulnerabilityEvidenceUnavailable("PRIVATE_SCOPE_EXCLUDED")
         result: Dict[str, List[Dict[str, Any]]] = {}
-        missing = [v for v in versions if (pkg, v) not in self.osv_cache]
+        missing = []
+        for version in versions:
+            key = (pkg, version)
+            if key in self.osv_cache:
+                try:
+                    validate_osv_entries(self.osv_cache[key])
+                except InvalidOsvEvidence:
+                    self.osv_cache.pop(key, None)
+            if key not in self.osv_cache:
+                missing.append(version)
         self.progress(operation=f"OSV query ({len(missing)} version(s))", package=pkg, step="scan")
         batch_total = (len(missing) + self.batch_size - 1) // self.batch_size if missing else 0
         for i in range(0, len(missing), self.batch_size):
@@ -3409,23 +3422,22 @@ class LiveDataClient:
                     lambda payload=payload: self.session.post(OSV_QUERY_BATCH, json=payload, timeout=self._budgeted_timeout(), stream=True)
                 )
                 r.raise_for_status()
-                data = self._bounded_json(r).get("results", [])
-                self._prefetch_osv_details([
-                    ref["id"] for item in data for ref in (item.get("vulns", []) or [])
-                    if ref.get("id")
-                ])
-                for v, item in zip(batch, data):
-                    details: List[Dict[str, Any]] = []
-                    for ref in item.get("vulns", []) or []:
-                        vuln_id = ref.get("id")
-                        if vuln_id:
-                            details.append(self.fetch_osv_vuln(vuln_id))
-                    self.osv_cache[(pkg, v)] = details
+                references = osv_batch_references(self._bounded_json(r), len(batch))
+                self._prefetch_osv_details([identifier for refs in references for identifier in refs])
+                staged = {
+                    (pkg, version): [self.fetch_osv_vuln(identifier) for identifier in refs]
+                    for version, refs in zip(batch, references)
+                }
+                # A malformed later result must not leave earlier pairs marked
+                # clean. Publish only after the full positional batch succeeds.
+                self.osv_cache.update(staged)
                 self._bounded_sleep(self.sleep_sec)
             except DraftBudgetExceeded:
                 raise
             except VulnerabilityEvidenceUnavailable:
                 raise
+            except InvalidOsvEvidence as exc:
+                raise VulnerabilityEvidenceUnavailable(str(exc)) from exc
             except Exception as e:
                 # UNKNOWN must not be cached as []: [] means a successful query
                 # with zero known vulnerabilities.
@@ -3439,6 +3451,8 @@ class LiveDataClient:
                     f"OSV_QUERY_INCOMPLETE: {pkg}@{v}: query returned no authoritative result"
                 )
             result[v] = self.osv_cache[key]
+            if diagnostics is not None:
+                diagnostics[v] = severity_evidence_diagnostic(result[v], package=pkg, source="ONLINE_OSV")
         return result
 
     def _prefetch_osv_details(self, references: Sequence[str]) -> None:
@@ -3448,6 +3462,14 @@ class LiveDataClient:
         Deadline expiry or any missing evidence remains an error; a late worker
         can mutate only its private client, never the published parent state.
         """
+        if any(not valid_osv_id(identifier) for identifier in references):
+            raise VulnerabilityEvidenceUnavailable("OSV_REFERENCE_INVALID")
+        for identifier in references:
+            if identifier in self.vuln_detail_cache:
+                try:
+                    validate_osv_detail(self.vuln_detail_cache[identifier], identifier)
+                except InvalidOsvEvidence:
+                    self.vuln_detail_cache.pop(identifier, None)
         ids = sorted(set(references) - self.vuln_detail_cache.keys())
         if len(ids) < 2:
             return
@@ -3492,8 +3514,14 @@ class LiveDataClient:
     def fetch_osv_vuln(self, vuln_id: str) -> Dict[str, Any]:
         if os.environ.get("DEPLOOM_DRAFT_DISABLE_EXTERNAL_EVIDENCE") == "1":
             raise VulnerabilityEvidenceUnavailable("External vulnerability queries disabled by host policy")
+        if not valid_osv_id(vuln_id):
+            raise VulnerabilityEvidenceUnavailable("OSV_REFERENCE_INVALID")
         if vuln_id in self.vuln_detail_cache:
-            return self.vuln_detail_cache[vuln_id]
+            try:
+                validate_osv_detail(self.vuln_detail_cache[vuln_id], vuln_id)
+                return self.vuln_detail_cache[vuln_id]
+            except InvalidOsvEvidence:
+                self.vuln_detail_cache.pop(vuln_id, None)
         self.progress(operation="OSV detail", package=vuln_id, step="scan")
         try:
             r = self._supervised(
@@ -3501,13 +3529,14 @@ class LiveDataClient:
             )
             r.raise_for_status()
             data = self._bounded_json(r)
-            if not isinstance(data, dict):
-                raise ValueError("OSV vulnerability detail is not an object")
+            validate_osv_detail(data, vuln_id)
             self.vuln_detail_cache[vuln_id] = data
             self._bounded_sleep(self.sleep_sec)
             return data
         except DraftBudgetExceeded:
             raise
+        except InvalidOsvEvidence as exc:
+            raise VulnerabilityEvidenceUnavailable(str(exc)) from exc
         except Exception as e:
             raise VulnerabilityEvidenceUnavailable(
                 f"OSV_VULN_DETAIL_UNAVAILABLE: {vuln_id}: {str(e)[-500:]}"
@@ -4270,40 +4299,22 @@ def versions_from_current(meta: Dict[str, Any], current: str, include_prerelease
     return candidates, note
 
 
-def severity_rank(vuln: Dict[str, Any]) -> int:
-    dbs = vuln.get("database_specific") if isinstance(vuln.get("database_specific"), dict) else {}
-    sev = str(dbs.get("severity") or "").lower()
-    if sev == "critical":
-        return 4
-    if sev == "high":
-        return 3
-    if sev in ("moderate", "medium"):
-        return 2
-    if sev == "low":
-        return 1
-
-    # GitHub advisories commonly provide database_specific.severity, but other OSV sources may provide CVSS.
-    for item in vuln.get("severity") or []:
-        score = str(item.get("score") if isinstance(item, dict) else "")
-        m = re.search(r"(?:^|\s)(\d+(?:\.\d+)?)", score)
-        if m:
-            x = float(m.group(1))
-            if x >= 9.0:
-                return 4
-            if x >= 7.0:
-                return 3
-            if x >= 4.0:
-                return 2
-            return 1
-    return 0
+def severity_rank(vuln: Dict[str, Any], *, package: str | None = None) -> int:
+    return assess_severity(vuln, package=package).rank or 0
 
 
-def vuln_summary(vulns: List[Dict[str, Any]]) -> str:
+def vuln_summary(vulns: List[Dict[str, Any]], *, package: str | None = None) -> str:
     if not vulns:
         return "0"
     counts = {"C": 0, "H": 0, "M": 0, "L": 0, "U": 0}
     for v in vulns:
-        counts[SEVERITY_LABELS.get(severity_rank(v), "U")] += 1
+        assessment = assess_severity(v, package=package)
+        if assessment.rank is not None:
+            counts[SEVERITY_LABELS[assessment.rank]] += 1
+        if not assessment.complete:
+            # U counts incomplete assessments. A partially rated finding also
+            # retains its known category; U is not a second distinct advisory.
+            counts["U"] += 1
     return ", ".join(f"{k}:{v}" for k, v in counts.items() if v)
 
 
@@ -4312,6 +4323,7 @@ def min_by_vuln(
     vulns_by_version: Dict[str, List[Dict[str, Any]]],
     mode: str,
     is_available: Optional[Callable[[str], bool]] = None,
+    *, package: str | None = None,
 ) -> str:
     for v in candidates:
         if v not in vulns_by_version:
@@ -4321,15 +4333,7 @@ def min_by_vuln(
             # a version hidden beyond an explicit candidate limit).
             continue
         vulns = vulns_by_version.get(v, [])
-        ranks = [severity_rank(x) for x in vulns]
-        matches = False
-        if mode == "no-critical" and not any(r >= 4 for r in ranks):
-            matches = True
-        if mode == "no-high" and not any(r >= 3 for r in ranks):
-            matches = True
-        if mode == "no-vuln" and not vulns:
-            matches = True
-        if matches and (is_available is None or is_available(v)):
+        if security_goal_satisfied(vulns, mode, package=package) and (is_available is None or is_available(v)):
             return v
     if is_available is not None:
         return "не найден installable target в configured registry; metadata/tarball нужно проверить"
@@ -5608,7 +5612,8 @@ def analyze_project(
             osv_candidates = [version for version in osv_candidates if version != current]
         try:
             vulns = client.query_osv_versions(name, osv_candidates, progress_label=dependency_label,
-                                             **({"diagnostics": diagnostics, "public_fallback": True, "advisory_metadata": meta} if offline_query else {}),
+                                             **({"diagnostics": diagnostics} if isinstance(client, LiveDataClient) else {}),
+                                             **({"public_fallback": True, "advisory_metadata": meta} if offline_query else {}),
                                              **({"excluded_public_version": excluded_public_version}
                                                 if excluded_public_version is not None else {}))
         except VulnerabilityEvidenceUnavailable as exc:
@@ -5632,10 +5637,10 @@ def analyze_project(
             min_nv = "неизвестно"
             notes.append("OSV evidence недоступен: уязвимости неизвестны, safe target по уязвимостям не вычислялся")
         else:
-            current_summary = vuln_summary(vulns[current]) if current in vulns else "unknown"
-            min_nc = min_by_vuln(search_versions, vulns, "no-critical", target_available)
-            min_nh = min_by_vuln(search_versions, vulns, "no-high", target_available)
-            min_nv = min_by_vuln(search_versions, vulns, "no-vuln", target_available)
+            current_summary = vuln_summary(vulns[current], package=name) if current in vulns else "unknown"
+            min_nc = min_by_vuln(search_versions, vulns, "no-critical", target_available, package=name)
+            min_nh = min_by_vuln(search_versions, vulns, "no-high", target_available, package=name)
+            min_nv = min_by_vuln(search_versions, vulns, "no-vuln", target_available, package=name)
         registry_artifacts: Dict[str, Dict[str, Any]] = {}
         for candidate_target in {latest, min_nc, min_nh, min_nv, min_12, min_9, min_6, min_3}:
             if not target_is_action(candidate_target):
@@ -5695,9 +5700,10 @@ def analyze_project(
             notes="; ".join(notes),
             registry_artifacts=registry_artifacts,
             registry_candidate_diagnostics=registry_candidate_diagnostics,
-            vuln_evidence_by_version={v: vuln_summary(entries) for v, entries in (vulns or {}).items()},
+            vuln_evidence_by_version={v: vuln_summary(entries, package=name) for v, entries in (vulns or {}).items()},
             draft_scan_state="done",
-            draft_unknown="osv-unavailable" if vulns is None or current not in vulns else "",
+            draft_unknown="osv-unavailable" if vulns is None or current not in vulns
+                or diagnostics.get(current, {}).get("status") == "UNKNOWN" else "",
             current_security_evidence=diagnostics.get(current, {}),
             candidate_search_truncated=candidate_search_truncated,
             candidate_search_truncated_note=candidate_search_truncated_note,
@@ -24439,16 +24445,16 @@ def stable_sha256_bytes(payload: bytes) -> str:
 
 
 def _summary_has_unrated_vulns(summary: Optional[str]) -> bool:
-    """C1: a detected finding without a severity rating (U) is evidence of a
-    vulnerability whose impact was never classified -- it is NOT a proven zero.
+    """C1: a finding without a complete severity assessment (U) is NOT a proven
+    zero. It may also retain a known category when another rating is invalid.
     This is the single definition shared by the Fast gate (for the EXACT chosen
     version) and by health/Draft (for the installed version)."""
     return bool(summary is not None and parse_vuln_counts(summary).get("U", 0) > 0)
 
 
 def _row_has_unrated_vulns(row: DependencyRow) -> bool:
-    """C1: does the CURRENT version carry a vulnerability without a severity
-    rating? Distinct from `_row_security_known` (OSV assessed at all) and from
+    """C1: does the CURRENT version carry an incompletely rated vulnerability?
+    Distinct from `_row_security_known` (OSV assessed at all) and from
     a proven zero (`0` summary): all three states must stay separate."""
     return _summary_has_unrated_vulns(row.current_vulns)
 
@@ -24713,9 +24719,12 @@ def _projected_row_security_full(row: DependencyRow, target: str) -> Tuple[int, 
     high = _severity_at_candidate_version(row, post_version, "H")
     moderate = _severity_at_candidate_version(row, post_version, "M")
     low = _severity_at_candidate_version(row, post_version, "L")
-    if crit is None or high is None or moderate is None or low is None:
+    unrated = _severity_at_candidate_version(row, post_version, "U")
+    if crit is None or high is None or moderate is None or low is None or unrated is None:
         return 0, 0, 0, 0, False
-    return int(crit), int(high), int(moderate), int(low), True
+    # Preserve positive observations even when another supplied rating is
+    # unknown; the projection cannot certify closure until all are complete.
+    return int(crit), int(high), int(moderate), int(low), unrated == 0
 
 
 def enrich_final_registry_security(
@@ -24730,7 +24739,12 @@ def enrich_final_registry_security(
             target = _draft_target_for_major(row)
             version = _post_plan_version(row, target)
             parsed = safe_version(version)
-            if parsed is None or str(parsed) != version or _projected_row_security_full(row, target)[-1]:
+            if parsed is None or str(parsed) != version:
+                continue
+            if _severity_at_candidate_version(row, version, "U") is not None:
+                # Existing findings, including incomplete ratings, are evidence
+                # for this pair. An independent registry omission must not
+                # overwrite them with a clean result. Enrich only missing pairs.
                 continue
             if (os.environ.get("DEPLOOM_DRAFT_OSV_DIR") and version == row.current_version
                     and (row.current_security_evidence.get("osvReason")
@@ -24740,6 +24754,7 @@ def enrich_final_registry_security(
             missing[row.name, version].append(row)
     if not missing:
         return
+    diagnostics_by_pair: Dict[Tuple[str, str], Dict[str, Any]] = {}
     if os.environ.get("DEPLOOM_DRAFT_OSV_DIR"):
         assessed = {}
         for pkg, version in missing:
@@ -24750,18 +24765,31 @@ def enrich_final_registry_security(
                     pkg, [version], diagnostics=diagnostics, public_fallback=candidate_only)[version]
             except VulnerabilityEvidenceUnavailable:
                 pass
+            if version in diagnostics:
+                diagnostics_by_pair[pkg, version] = diagnostics[version]
             for row in missing[pkg, version]:
                 if row.current_version == version and version in diagnostics:
                     row.current_security_evidence = diagnostics[version]
     else:
         assessed = client._query_registry_security_pairs(sorted(missing), approved_registry)
     for pair, advisories in assessed.items():
-        summary = vuln_summary(advisories)
+        summary = vuln_summary(advisories, package=pair[0])
+        prior_diagnostic = diagnostics_by_pair.get(pair, {})
+        severity_diagnostic = severity_evidence_diagnostic(
+            advisories, package=pair[0],
+            source=prior_diagnostic.get("source", "REGISTRY_BULK_ADVISORY"),
+        )
+        diagnostic = {**severity_diagnostic, **prior_diagnostic}
+        if severity_diagnostic["status"] == "UNKNOWN":
+            diagnostic.update(severity_diagnostic)
         version = pair[1]
         for row in missing[pair]:
             if version == row.current_version:
                 row.current_vulns = summary
-                if row.draft_unknown == "osv-unavailable":
+                row.current_security_evidence = dict(diagnostic)
+                if diagnostic["status"] == "UNKNOWN" and row.draft_unknown in ("", "osv-unavailable"):
+                    row.draft_unknown = "osv-unavailable"
+                elif diagnostic["status"] != "UNKNOWN" and row.draft_unknown == "osv-unavailable":
                     row.draft_unknown = ""
             else:
                 row.vuln_evidence_by_version[version] = summary
